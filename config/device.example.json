@@ -1,0 +1,5 @@
+{
+  "base_url": "https://example.invalid",
+  "protocols": ["companion.desktop.v1"],
+  "permissions": []
+}
