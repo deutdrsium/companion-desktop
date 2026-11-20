@@ -10,6 +10,26 @@ Local desktop runtime for an AstrBot companion character:
 
 Status: early development. Work packages P0–P9 are tracked in issues/PRs.
 
+## Desktop client (U1)
+
+`src/companion_desktop/` contains the panel UI (`ui/`) and the client shell (`client/`):
+launch card, server link with automatic reconnect, an adapter for the current AstrBot
+desktop HTTP API, local voice playback, the loopback subtitle feed for a VTube Studio
+Web Item (1024 × 200) and the tray.
+
+```
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[test]"
+copy config\client.example.json config\client.json   # then fill in; config/*.json is git-ignored
+.venv\Scripts\pythonw -m companion_desktop
+```
+
+The connection key is read from the OS credential store (`account.keyring_service` /
+`account.username`). Options: `--config PATH`, `--no-helpers`, `--steam-autostart`.
+
+Tests run offscreen: `QT_QPA_PLATFORM=offscreen python -m pytest`.
+`tools/render_states.py OUT_DIR` renders every panel state with placeholder text.
+
 ## Privacy rules for this repository
 
 This repository is public from the first commit. Never commit:

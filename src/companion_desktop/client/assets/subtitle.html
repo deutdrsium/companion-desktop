@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<!--
+  VTube Studio Web Item subtitle page. Web Item size: 1024 x 200, transparent background.
+  Polls the loopback state endpoint every 120 ms:
+    {"seq": 12, "state": "speaking|interrupted|idle", "text": "...", "progress": 0..1,
+     "style": "plate|outline", "size": 1.0, "hold_ms": 1800, "nameplate": true}
+  ?demo=speaking|interrupted|idle|long|outline renders a fixed state with no network.
+-->
+<style>
+:root{
+  --paper:#FFF9EE; --plate:rgba(43,39,34,.82); --name:#CFE3D8; --bar:#9CC7B4;
+  --in:160ms; --out:400ms; --interrupt:200ms; --size:40px;
+}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}
+body{display:flex;align-items:flex-end;justify-content:center;padding-bottom:14px;box-sizing:border-box;
+     font-family:VOICE_FONT,"Noto Serif SC","Noto Serif CJK SC","Source Han Serif SC","SimSun",serif}
+#box{max-width:92%;display:flex;flex-direction:column;align-items:center;gap:6px;
+     opacity:0;transform:translateY(6px);
+     transition:opacity var(--out) ease, transform var(--out) ease}
+#box.on{opacity:1;transform:none;transition:opacity var(--in) ease-out, transform var(--in) ease-out}
+#box.cut{opacity:0;transform:scaleY(.92);transition:opacity var(--interrupt) ease-in, transform var(--interrupt) ease-in}
+#name{font:600 15px/1 "Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC",sans-serif;letter-spacing:.12em;
+      color:var(--name);background:var(--plate);padding:5px 10px 5px 12px;border-radius:999px}
+body.noname #name{display:none}
+#line{position:relative;color:var(--paper);background:var(--plate);
+      font-size:var(--size);line-height:1.45;padding:10px 26px 14px;border-radius:18px;
+      text-align:center;white-space:pre-wrap;overflow-wrap:anywhere;
+      box-shadow:0 6px 24px rgba(20,16,12,.25)}
+#bar{position:absolute;left:26px;right:26px;bottom:7px;height:3px;border-radius:2px;background:rgba(255,249,238,.18);overflow:hidden}
+#bar i{display:block;height:100%;width:0;background:var(--bar);border-radius:2px;transition:width 120ms linear}
+body.outline #line{background:none;box-shadow:none;color:#fff;
+      text-shadow:0 0 1px #2B2722,0 0 2px #2B2722,0 2px 3px rgba(43,39,34,.9),0 0 8px rgba(43,39,34,.6)}
+body.outline #name{background:rgba(43,39,34,.55)}
+body.outline #bar{display:none}
+</style></head>
+<body>
+<div id="box"><div id="name"></div><div id="line"><span id="text"></span><div id="bar"><i></i></div></div></div>
+<script>
+const ENDPOINT = ENDPOINT_JSON;
+const NAME = NAME_JSON;
+const box=document.getElementById('box'), text=document.getElementById('text'),
+      bar=document.querySelector('#bar i'), line=document.getElementById('line');
+document.getElementById('name').textContent=NAME;
+let seq=-1, hold=null, base=40;
+function fit(){ /* binary search on font size, min 18px */
+  let lo=18, hi=base;
+  line.style.fontSize=hi+'px';
+  const max=window.innerHeight-48;
+  if(line.getBoundingClientRect().height<=max) return;
+  while(hi-lo>1){const mid=(lo+hi)>>1; line.style.fontSize=mid+'px';
+    if(line.getBoundingClientRect().height>max) hi=mid; else lo=mid;}
+  line.style.fontSize=lo+'px';
+}
+function apply(s){
+  document.body.classList.toggle('outline', s.style==='outline');
+  document.body.classList.toggle('noname', s.nameplate===false);
+  const want=40*(s.size||1);
+  if(want!==base){base=want; document.documentElement.style.setProperty('--size', base+'px'); fit();}
+  bar.style.width=Math.round((s.progress||0)*100)+'%';
+  if(s.state==='speaking'){
+    clearTimeout(hold); hold=null;
+    if(s.seq!==seq||!box.classList.contains('on')){seq=s.seq; text.textContent=s.text||''; fit();}
+    box.classList.remove('cut'); box.classList.add('on');
+  }else if(s.state==='interrupted'){
+    clearTimeout(hold); hold=null;
+    box.classList.add('cut'); box.classList.remove('on');
+  }else{ /* idle: keep the last line for hold_ms, then fade */
+    box.classList.remove('cut');
+    if(box.classList.contains('on')&&!hold) hold=setTimeout(()=>{box.classList.remove('on');hold=null;}, s.hold_ms||1800);
+  }
+}
+const demo=new URLSearchParams(location.search).get('demo');
+if(demo){
+  const D={
+    speaking:{seq:1,state:'speaking',text:'这是一句示例字幕。',progress:.46},
+    long:{seq:2,state:'speaking',text:'这是一句比较长的示例字幕，用来检查自动缩小字号以后仍然能完整显示在字幕区域里。',progress:.2},
+    outline:{seq:3,state:'speaking',style:'outline',text:'这是一句示例字幕。',progress:.46},
+    interrupted:{seq:1,state:'speaking',text:'这句被打断了。',progress:.3},
+    idle:{seq:0,state:'idle',text:''}
+  }[demo]||{};
+  for(const k of ['--in','--out','--interrupt']) document.documentElement.style.setProperty(k,'0ms');
+  apply(D);
+  if(demo==='interrupted'){box.style.opacity='.38';box.style.transform='scaleY(.96)';}
+}else if(ENDPOINT){
+  async function tick(){
+    try{const r=await fetch(ENDPOINT,{cache:'no-store'}); if(r.ok) apply(await r.json()); else apply({state:'interrupted'});}
+    catch(_){apply({state:'interrupted'});}
+    setTimeout(tick,120);
+  }
+  tick();
+}
+window.addEventListener('resize',fit);
+</script></body></html>
