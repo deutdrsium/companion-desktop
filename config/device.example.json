@@ -1,0 +1,5 @@
+{
+  "endpoint": "https://example.invalid/api/v1/plugins/extensions/astrbot_plugin_private_companion/desktop/session",
+  "protocols": ["companion.desktop.v1"],
+  "permissions": []
+}
