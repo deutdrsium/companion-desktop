@@ -5,7 +5,7 @@ import unittest
 
 from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 from companion_desktop.contracts.types import PROTOCOL
-from companion_desktop.contracts.wire import ProtocolError, message
+from companion_desktop.contracts.wire import MAX_REQUEST_BYTES, ProtocolError, encode_request, message
 from companion_desktop.session.client import DesktopSession
 from companion_desktop.session.dispatcher import Dispatcher, OutputResult
 
@@ -191,6 +191,64 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(lambda: any(event.get("status") == "cancelled" for event in events))
         self.assertEqual([event["status"] for event in events if event["type"] == "turn.cancelled"], ["unknown", "cancelled"])
         self.assertEqual(chat.cancelled, [turn_id])
+
+    async def test_cancel_can_retry_after_a_lookup_misses_delayed_admission(self):
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+        host = SessionHost()
+        chat = FakeChat(stop=False)
+        ref = host.handle(binding, "register", {"protocols": [PROTOCOL], "permissions": ["speak"]})["session"]
+        self.addCleanup(host.handle, binding, "disconnect", {"session": ref, "messages": [], "turns": []})
+
+        def exchange(*messages, turns=()):
+            return host.handle(binding, "exchange", {"session": ref, "messages": list(messages), "turns": list(turns)},
+                               turns=chat)["messages"]
+
+        accepted, = exchange(message("turn.send", ref, {"client_msg_id": "msg-demo", "text": "Hello"}))
+        await self.wait_for(lambda: bool(chat.calls))
+        turn_id = accepted["body"]["turn_id"]
+        cancel = message("turn.cancel", ref, {"turn_id": turn_id})
+        self.assertEqual(exchange(cancel)[0]["body"]["status"], "unknown")
+        await self.wait_for(lambda: chat.cancelled == [turn_id])
+
+        chat.stop = True  # WebChat has now admitted the event for this checkpoint.
+        self.assertEqual(exchange(cancel)[0]["body"]["status"], "unknown")
+        await self.wait_for(chat.result.done)
+        self.assertEqual(chat.cancelled, [turn_id, turn_id])
+        self.assertEqual(exchange(turns=["msg-demo"])[0]["body"]["status"], "cancelled")
+
+    async def test_exchange_splits_large_utf8_batch_and_drains_pending_messages(self):
+        batches, events = [], []
+
+        async def transport(operation, payload):
+            if operation == "register":
+                return {"protocol": PROTOCOL, "session": DEMO, "permissions": ["speak"]}
+            self.assertLessEqual(len(encode_request(operation, payload)), MAX_REQUEST_BYTES)
+            self.assertLessEqual(len(payload["messages"]), 32)
+            if operation == "disconnect":
+                return {}
+            sent = [frame["body"] for frame in payload["messages"] if frame["type"] == "turn.send"]
+            if sent:
+                batches.append(sent)
+            return {"permissions": ["speak"], "messages": [
+                message("turn.accepted", DEMO, {"client_msg_id": body["client_msg_id"], "turn_id": body["client_msg_id"]})
+                for body in sent
+            ] + [message("turn.completed", DEMO, {"client_msg_id": key, "turn_id": key, "text": "Saved"})
+                 for key in payload["turns"]]}
+
+        desktop = DesktopSession(transport, permissions={"speak"}, poll_interval=0.01)
+        self.addAsyncCleanup(desktop.close)
+        desktop.subscribe(events.append)
+        desktop.start()
+        await self.wait_for(lambda: desktop.connection["state"] == "connected")
+        text = "\U00010000" * 4000
+        expected = [{"client_msg_id": f"msg-{i}", "text": text} for i in range(32)]
+        for body in expected:
+            desktop.send_message(**body)
+        await self.wait_for(lambda: sum(event["type"] == "turn.completed" for event in events) == len(expected))
+
+        self.assertGreater(len(batches), 1)
+        self.assertEqual([body for batch in batches for body in batch], expected)
+        self.assertFalse(any(event.get("state") == "reconnecting" for event in events))
 
     async def test_durable_turn_claim_and_binding_isolation(self):
         with TemporaryDirectory() as directory:

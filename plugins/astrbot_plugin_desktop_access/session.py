@@ -74,6 +74,7 @@ class _Turn:
     backend: TurnBackend
     started: bool = False
     stop_requested: bool = False
+    stop_lookup_running: bool = False
     result: TurnResult | None = None
 
 
@@ -425,11 +426,14 @@ class SessionHost:
             await turn.backend.cancel(turn.turn_id)
         except Exception:
             pass  # A stop request is not termination evidence.
+        finally:
+            turn.stop_lookup_running = False
 
     def _stop_turn(self, turn):
-        if turn.result is None and not turn.stop_requested:
+        if turn.result is None:
             turn.stop_requested = True
-            if turn.started:
+            if turn.started and not turn.stop_lookup_running:
+                turn.stop_lookup_running = True
                 self._spawn(self._cancel_backend(turn))
 
     def _send_turn(self, connection, body, backend):
@@ -455,25 +459,27 @@ class SessionHost:
             self._spawn(self._run_turn(turn, text))
         return message("turn.accepted", ref, ids)
 
-    def _turn_frame(self, connection, client_id):
-        ref, key = connection.ref, connection.binding.key
-        turn = self._turns.get((key, client_id))
-        if turn is None:
+    def _turn_results(self, connection, requested):
+        key = connection.binding.key
+        for client_id in requested:
+            turn = self._turns.get((key, client_id))
+            if turn is not None:
+                if turn.result is not None:
+                    yield client_id, turn.turn_id, turn.result
+                continue
             claim = self._claims.lookup(key, client_id)
-            if claim is None:
-                return None
-            ids = {"client_msg_id": client_id, "turn_id": claim[1]}
-            result = TurnResult("unknown")
-        elif turn.result is None:
-            return None
-        else:
-            ids = {"client_msg_id": client_id, "turn_id": turn.turn_id}
-            result = turn.result
+            if claim is not None:
+                yield client_id, claim[1], None
+
+    def _turn_frame(self, ref, client_id, turn_id, result):
+        ids = {"client_msg_id": client_id, "turn_id": turn_id}
+        if result is None or result.status == "unknown":
+            return message("turn.failed", ref, {**ids, "reason": "result_unknown"})
         if result.status == "completed":
             return message("turn.completed", ref, {**ids, "text": result.text})
         if result.status == "cancelled":
-            return self._cancel_frame(ref, turn.turn_id, "cancelled")
-        return message("turn.failed", ref, {**ids, "reason": "result_unknown" if result.status == "unknown" else "generation_failed"})
+            return self._cancel_frame(ref, turn_id, "cancelled")
+        return message("turn.failed", ref, {**ids, "reason": "generation_failed"})
 
     @staticmethod
     def _cancel_frame(ref, turn_id, status):
@@ -505,9 +511,7 @@ class SessionHost:
                 frames.append(frame)
         return frames
 
-    def handle(self, binding, operation, payload, *, turns=None, snapshots=None, on_message=None):
-        if operation == "register":
-            return self._register(binding, payload)
+    def _receive_exchange(self, binding, operation, payload, turns, on_message):
         if operation not in {"exchange", "disconnect"} or not fields(payload, {
             "session": obj, "messages": array(obj), "turns": array(string),
         }) or max(len(payload["messages"]), len(payload["turns"])) > BATCH_LIMIT:
@@ -548,17 +552,41 @@ class SessionHost:
                             on_message(frame)
         if operation == "disconnect":
             self._retire(connection, "disconnected")
-            return {}
+            return None
         self._refresh(connection)
         now = self.clock()
         for request_id, (_, deadline) in tuple(connection.observations.items()):
             if now >= deadline:
                 del connection.observations[request_id]
-        for client_id in sorted(requested) if "speak" in connection.permissions else ():
-            frame = self._turn_frame(connection, client_id)
-            if frame is not None:
-                replies.append(frame)
+        return connection, replies, sorted(requested) if "speak" in connection.permissions else ()
+
+    def _finish_exchange(self, connection, replies, snapshots):
         if connection.capabilities is not None and snapshots is not None:
             replies.extend(self._snapshots(connection, snapshots))
         replies.extend(self._drain(connection))
         return {"messages": replies, "permissions": sorted(connection.permissions)}
+
+    def handle(self, binding, operation, payload, *, turns=None, snapshots=None, on_message=None):
+        if operation == "register":
+            return self._register(binding, payload)
+        exchange = self._receive_exchange(binding, operation, payload, turns, on_message)
+        if exchange is None:
+            return {}
+        connection, replies, requested = exchange
+        for client_id, turn_id, result in self._turn_results(connection, requested):
+            replies.append(self._turn_frame(connection.ref, client_id, turn_id, result))
+        return self._finish_exchange(connection, replies, snapshots)
+
+    async def exchange_with_recovery(self, binding, payload, *, turns, recover, snapshots=None, on_message=None):
+        """Resolve claim-only turns from durable history before replying."""
+        connection, replies, requested = self._receive_exchange(binding, "exchange", payload, turns, on_message)
+        for client_id, turn_id, result in self._turn_results(connection, requested):
+            if result is None:
+                text = await recover(turn_id)
+                self._active(connection.ref)
+                if "speak" not in connection.permissions:
+                    raise ProtocolError("unauthorized")
+                if text is not None:
+                    result = TurnResult("completed", text)
+            replies.append(self._turn_frame(connection.ref, client_id, turn_id, result))
+        return self._finish_exchange(connection, replies, snapshots)

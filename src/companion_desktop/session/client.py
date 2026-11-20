@@ -14,7 +14,8 @@ from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, PROTOCOL, Connection
 from companion_desktop.contracts.wire import (
-    HOST_TYPES, ProtocolError, array, fields, message, obj, observation_state, parse, parse_ref,
+    HOST_TYPES, MAX_REQUEST_BYTES, ProtocolError, array, encode_request, fields, message, obj,
+    observation_state, parse, parse_ref,
 )
 from .dispatcher import Dispatcher
 
@@ -158,7 +159,7 @@ class HttpTransport:
         self._opener = build_opener(_NoRedirect())
 
     def _call(self, operation, payload):
-        data = json.dumps({"operation": operation, "payload": payload}, ensure_ascii=False).encode("utf-8")
+        data = encode_request(operation, payload)
         req = Request(self.endpoint, data=data,
                       headers={"Authorization": "Bearer " + self._credential, "Content-Type": "application/json"})
         try:
@@ -226,7 +227,10 @@ class DesktopSession(_SessionEvents):
 
     def publish_capabilities(self, capabilities):
         body = deepcopy(capabilities)
-        message("capabilities", {"device_id": "local", "desktop_session_id": "local", "generation": 1}, body)
+        ref = self.session or {"device_id": "local", "desktop_session_id": "local", "generation": 1}
+        frame = message("capabilities", ref, body)
+        if len(encode_request("exchange", {"session": ref, "messages": [frame], "turns": []})) > MAX_REQUEST_BYTES:
+            raise ProtocolError("invalid_request")
         if body == self._local_caps:
             return
         if body["revision"] <= self._local_caps["revision"] and self._published_revision:
@@ -322,26 +326,55 @@ class DesktopSession(_SessionEvents):
         self._grant = frozenset()
         self._set_capabilities()
 
-    async def _exchange(self, operation="exchange", *, attempt=0):
-        ref = self.session
+    def _exchange_payload(self, operation, ref, caps):
         frames = []
-        count = min(len(self._reports), 32)
-        for _ in range(count):
-            frames.append(self._reports.popleft())
-        caps = self._local_caps
-        if operation == "exchange" and caps["revision"] != self._published_revision and len(frames) < 32:
-            frames.append(message("capabilities", ref, caps))
-        for kind, work in (("turn.cancel", self._cancels), ("turn.send", self._sends)):
-            if operation != "exchange":
+        pending = list(self._active_turns)[:32] if operation == "exchange" else []
+        payload = {"session": ref, "messages": frames, "turns": pending}
+
+        def append(frame):
+            # True queues the frame, False defers it, and None means it cannot fit alone.
+            if len(frames) >= 32:
+                return False
+            frames.append(frame)
+            if len(encode_request(operation, payload)) <= MAX_REQUEST_BYTES:
+                return True
+            if len(frames) > 1:
+                frames.pop()
+                return False
+            if pending and len(encode_request(operation, {**payload, "turns": []})) <= MAX_REQUEST_BYTES:
+                pending.clear()
+                return True
+            frames.pop()
+            return None
+
+        while self._reports:
+            if append(self._reports[0]) is False:
                 break
-            for key, value in work.items():
-                if len(frames) >= 32:
-                    break
-                body = {"turn_id": key} if kind == "turn.cancel" else {"client_msg_id": key, "text": value}
-                frames.append(message(kind, ref, body))
+            self._reports.popleft()
+        if operation == "exchange":
+            if caps["revision"] != self._published_revision:
+                append(message("capabilities", ref, caps))
+            for kind, work in (("turn.cancel", self._cancels), ("turn.send", self._sends)):
+                for key, value in tuple(work.items()):
+                    body = {"turn_id": key} if kind == "turn.cancel" else {"client_msg_id": key, "text": value}
+                    queued = append(message(kind, ref, body))
+                    if queued is False:
+                        break
+                    if queued is None:
+                        if kind == "turn.send":
+                            self._sends.pop(key, None)
+                            self._emit("turn.failed", client_msg_id=key, turn_id=None, reason="invalid_request")
+                        else:
+                            self._receive_turn("turn.cancelled", {"turn_id": key, "status": "unknown",
+                                                                  "reason": "result_unknown"})
+        return payload
+
+    async def _exchange(self, operation="exchange", *, attempt=0):
+        ref, caps = self.session, self._local_caps
+        payload = self._exchange_payload(operation, ref, caps)
+        frames = payload["messages"]
         before = self._clock()
-        response = await self._transport(operation, {"session": ref, "messages": frames,
-                                          "turns": list(self._active_turns)[:32] if operation == "exchange" else []})
+        response = await self._transport(operation, payload)
         if operation == "disconnect" or self._closing or self._reconfigure:
             return
         if not fields(response, {"messages": array(obj), "permissions": array(lambda item: item in PERMISSIONS)}):

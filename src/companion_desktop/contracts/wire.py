@@ -8,8 +8,15 @@ from typing import cast
 from .types import PROTOCOL, RECEIPT_STATUSES, Message, SessionRef
 
 
+MAX_REQUEST_BYTES = 262_144
+
+
 class ProtocolError(ValueError):
     """The message or version is invalid for this desktop protocol."""
+
+
+def encode_request(operation, payload):
+    return json.dumps({"operation": operation, "payload": payload}, ensure_ascii=False).encode("utf-8")
 
 
 def now_utc():
