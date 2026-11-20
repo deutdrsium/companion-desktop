@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "companion-desktop"
+version = "0.2.0"
+description = "Local desktop runtime for an AstrBot companion character"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt5>=5.15.10,<5.16",
+    "requests>=2.28",
+    "keyring>=24",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"companion_desktop.client" = ["assets/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

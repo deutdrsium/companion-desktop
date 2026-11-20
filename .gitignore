@@ -33,3 +33,6 @@ logs/
 recordings/
 screenshots/
 saves/
+
+# Local renders
+renders/

@@ -1,0 +1,38 @@
+{
+  "title": "桌面陪伴",
+  "character": {
+    "name": "小伴",
+    "glyph": "伴",
+    "avatar_image": "",
+    "voice_font": ""
+  },
+  "server": {
+    "base_url": "",
+    "ssh_target": "user@server.example",
+    "ssh_options": [],
+    "remote_port": 6185,
+    "api_path": "/api/v1/plugins/extensions/<companion-plugin>/desktop",
+    "chat_path": "/api/v1/chat"
+  },
+  "account": {
+    "username": "desktop-user",
+    "session_id": "00000000000000000000000000000000",
+    "keyring_service": "CompanionDesktop"
+  },
+  "subtitle": {
+    "port": 18676,
+    "token_file": ""
+  },
+  "instance_mutex": "Local\\CompanionDesktop",
+  "data_dir": "",
+  "helpers": [
+    {"argv": ["{python}", "C:/path/to/helper.pyw"], "cwd": "", "unique": true}
+  ],
+  "rhythm_command": {
+    "argv": ["ssh", "-o", "BatchMode=yes", "user@server.example", "run-desktop-rhythm {args}"],
+    "stdin_file": ""
+  },
+  "voice_key_command": {
+    "argv": ["ssh", "-o", "BatchMode=yes", "user@server.example", "run-voice-key-setup"]
+  }
+}

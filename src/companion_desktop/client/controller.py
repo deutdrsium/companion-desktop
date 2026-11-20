@@ -1,0 +1,624 @@
+"""Wires the backend adapter, player, subtitle feed and link to SessionState and the views.
+
+This is the only place that knows today's backend. U2 replaces the backend/player inputs
+with desktop-session and cerebellum events (``SessionState.apply_event``); the views stay.
+"""
+
+import logging
+import time
+from uuid import uuid4
+
+from PyQt5.QtCore import QObject, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtWidgets import QApplication
+
+from ..ui.observe import ConsentDialog
+from ..ui.panel import Panel
+from ..ui.session_state import SessionState
+from ..ui.settings import SettingsWindow
+from .protocol import desktop_locked, sentences, visible_text, vts_running
+
+log = logging.getLogger(__name__)
+
+OBSERVE_INTERVAL_MS = 305_000      # server keeps a five-minute minimum; allow for jitter
+ONE_SHOT_HOLD_MS = 600_000         # server uses an observation for 10 minutes
+GUARD_INTERVAL_MS = 3000
+
+
+class Controller(QObject):
+    def __init__(self, character, title, prefs, backend, link=None, player=None, subtitles=None,
+                 rhythm_service=None, voice_service=None, log_dir=None, tray=None, version="0.2"):
+        super().__init__()
+        self.character, self.title, self.prefs = character, title, prefs
+        self.backend, self.link, self.player, self.subtitles = backend, link, player, subtitles
+        self.rhythm_service, self.voice_service = rhythm_service, voice_service
+        self.log_dir, self.version = log_dir, version
+        self.state = SessionState(self)
+        self.panel = Panel(character, title, self.state, pinned=prefs.get("pinned"))
+        self.panel.on_close = self._close_requested
+        self.settings = None
+        self.tray = tray
+        self.quitting = False
+        self.ready = False
+        # turns
+        self.turns = {}            # turn_id -> {"text", "bubble", "resent"}
+        self.active_turn = None
+        self.outbox = []           # bubbles waiting for the current reply (sent while thinking)
+        self.resend = []           # bubbles that never reached the server; resent once on reconnect
+        # speech
+        self.reading = None        # ReplyBubble being read
+        self.reading_gen = None
+        # observation
+        self.obs_gen = 0
+        self.periodic = False
+        self.server_enabled = False
+        self.one_shot_pending = False   # waiting for "enabled" before the one-off observe
+        self.one_shot_active = False    # a one-off look is in flight
+        self.obs_timer = QTimer(self)
+        self.obs_timer.setInterval(OBSERVE_INTERVAL_MS)
+        self.obs_timer.timeout.connect(self._observe_periodic)
+        self.one_shot_stop = QTimer(self)
+        self.one_shot_stop.setSingleShot(True)
+        self.one_shot_stop.timeout.connect(self._end_one_shot)
+        self.guard = QTimer(self)
+        self.guard.setInterval(GUARD_INTERVAL_MS)
+        self.guard.timeout.connect(self._guard)
+        self._wire()
+
+    # ------------------------------------------------------------ wiring
+    def _wire(self):
+        p, b = self.panel, self.backend
+        p.send.connect(self.send)
+        p.stop.connect(self.stop)
+        p.typing.connect(self._typing)
+        p.reconnect_now.connect(self.reconnect_now)
+        p.pin_toggled.connect(lambda on: self.prefs.set("pinned", on))
+        p.open_settings.connect(self.open_settings)
+        p.copy_subtitle_url.connect(self.copy_subtitle_url)
+        p.quit.connect(self.quit)
+        p.popover.periodic_toggled.connect(self.set_periodic)
+        p.popover.autonomous_toggled.connect(self.set_autonomous)
+        p.popover.look_now.connect(self.look_now)
+        b.history.connect(self._history)
+        b.history_failed.connect(self._history_failed)
+        b.turn_accepted.connect(self._accepted)
+        b.chat_done.connect(self._chat_done)
+        b.chat_failed.connect(self._chat_failed)
+        b.audio.connect(self._audio)
+        b.speech_error.connect(self._speech_error)
+        b.screen_result.connect(self._screen_result)
+        if self.link is not None:
+            b.unreachable.connect(self.link.lost)
+            self.link.changed.connect(self._link_changed)
+            self.link.up.connect(self._link_up)
+        if self.player is not None:
+            self.player.set_volume(self.prefs.get("volume"))
+            self.player.started.connect(self._clip_started)
+            self.player.progress.connect(self._clip_progress)
+            self.player.finished.connect(self._clip_finished)
+            self.player.failed.connect(self._clip_failed)
+        if self.subtitles is not None:
+            self._subtitle_style()
+            self.state.progressed.connect(lambda f: self.subtitles.set_state("speaking", None, f)
+                                          if self.state.presence == "speaking" else None)
+        self.state.changed.connect(self._state_changed)
+        self.prefs.changed.connect(self._pref)
+        if self.tray is not None:
+            self.attach_tray(self.tray)
+
+    def attach_tray(self, t):
+        self.tray = t
+        if t is not None:
+            t.show_panel.connect(self.show_panel)
+            t.stop.connect(self.stop)
+            t.periodic_toggled.connect(self.set_periodic)
+            t.autonomous_toggled.connect(self.set_autonomous)
+            t.look_now.connect(self.look_now)
+            t.copy_subtitle_url.connect(self.copy_subtitle_url)
+            t.pin_toggled.connect(lambda on: self.prefs.set("pinned", on))
+            t.open_settings.connect(lambda: self.open_settings(0))
+            t.quit.connect(self.quit)
+            t.set_checks(False, False, self.prefs.get("pinned"))
+
+    def start(self):
+        """Connected: open the screen session and load history."""
+        self.state.set_connection("connected")
+        self.backend.screen(self.obs_gen, "open")
+        self.backend.load_history()
+
+    # ------------------------------------------------------------ window
+    def show_panel(self):
+        self.panel.show()
+        self.panel.raise_()
+        self.panel.activateWindow()
+
+    def _close_requested(self):
+        if self.quitting:
+            return True
+        if self.prefs.get("close_to_tray") and self.tray is not None and self.tray.icon.isVisible():
+            self.panel.hide()
+            if not self.prefs.get("tray_hint_shown"):
+                self.prefs.set("tray_hint_shown", True)
+                self.tray.notify_once(f"{self.character.name}还在托盘里。退出请用托盘菜单。")
+            return False
+        self.quit()
+        return True
+
+    def quit(self):
+        if self.quitting:
+            return
+        self.quitting = True
+        try:
+            self.prefs.store.setValue("geometry", self.panel.saveGeometry())
+            self._observation_off(notify=False)
+            self.stop_speech(collapse=True)
+            self.obs_gen += 1
+            self.backend.close(self.obs_gen)
+        finally:
+            if self.tray is not None:
+                self.tray.hide()
+            if self.settings is not None:
+                self.settings.close()
+            self.panel.close()
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+
+    def open_settings(self, page=0):
+        if self.settings is None:
+            url = self.subtitles.item_url if self.subtitles is not None else ""
+            s = SettingsWindow(self.character, self.prefs, self.state, url, self.rhythm_service,
+                               self.voice_service, self.version)
+            s.periodic_toggled.connect(self.set_periodic)
+            s.autonomous_toggled.connect(self.set_autonomous)
+            s.look_now.connect(self.look_now)
+            s.reconnect.connect(self.reconnect_now)
+            s.open_logs.connect(self.open_logs)
+            s.copy_subtitle_url.connect(self.copy_subtitle_url)
+            self.settings = s
+        self.settings.set_observe_switches(self.periodic, False)
+        self.settings.show_page(page)
+        self.settings.show()
+        self.settings.raise_()
+        self.settings.activateWindow()
+
+    def open_logs(self):
+        if self.log_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_dir)))
+
+    def copy_subtitle_url(self):
+        if self.subtitles is None:
+            self.panel.flash("offline", "字幕服务没有启动")
+            return
+        QApplication.clipboard().setText(self.subtitles.item_url)
+        self.panel.flash("idle", "已复制字幕地址")
+
+    def _pref(self, key, value):
+        if key == "pinned":
+            if self.panel.pinned != value:
+                self.panel.set_pinned(value)
+            if self.tray is not None:
+                self.tray.set_checks(pinned=value)
+        elif key == "volume" and self.player is not None:
+            self.player.set_volume(value)
+        elif key.startswith("subtitle_"):
+            self._subtitle_style()
+        elif key == "voice_enabled" and not value:
+            self.stop_speech(collapse=True)
+
+    def _subtitle_style(self):
+        if self.subtitles is not None:
+            self.subtitles.set_style(self.prefs.get("subtitle_style"), self.prefs.get("subtitle_size") / 100.0,
+                                     self.prefs.get("subtitle_hold_ms"), self.prefs.get("subtitle_nameplate"))
+
+    # ------------------------------------------------------------ state reactions
+    def _state_changed(self, state):
+        if state.presence == "idle" and self.reading is not None and self.reading.mode == "interrupted":
+            self.reading.set_mode("stopped")
+            self.reading = None
+        if state.presence in ("idle", "listening", "interrupted") and self.active_turn is None:
+            self._flush_outbox()
+
+    def _typing(self, active):
+        self.state.set_typing(active)
+        if active and self.state.presence == "speaking":
+            self.stop()  # typing while she speaks stops her first
+
+    # ------------------------------------------------------------ history
+    def _history(self, messages):
+        self.panel.chat.load_history(messages, strip=visible_text)
+        self.ready = True
+
+    def _history_failed(self):
+        self.ready = True
+        self.panel.chat.add_note("offline", "聊天记录暂时读不到，新的对话不受影响")
+
+    # ------------------------------------------------------------ turns
+    def send(self, text):
+        if not self.state.can_send:
+            self.panel.composer.restore_draft(text)
+            return
+        if self.state.presence == "speaking":
+            self.stop()
+        if self.state.presence == "thinking" and self.active_turn is not None:
+            bubble = self.panel.chat.add_user(text, "queued")
+            bubble.set_receipt("queued")
+            bubble.meta_label.setText("等她回答后再发")
+            self.outbox.append(bubble)
+            return
+        bubble = self.panel.chat.add_user(text, None)
+        self._dispatch(bubble)
+
+    def _dispatch(self, bubble, resent=False):
+        turn_id = uuid4().hex
+        bubble.turn_id = turn_id
+        bubble.at = time.time()
+        bubble.set_receipt("sending")
+        try:
+            bubble.retry.disconnect()
+        except TypeError:
+            pass
+        bubble.retry.connect(self._retry)
+        self.turns[turn_id] = {"text": bubble.text, "bubble": bubble, "resent": resent}
+        self.active_turn = turn_id
+        if self.reading is not None and self.reading.mode == "interrupted":
+            self.reading.set_mode("stopped")
+            self.reading = None
+        self.panel.chat.show_thinking()
+        self.panel.chat.scroll_to_bottom()
+        self.state.turn_sent(turn_id)
+        self.backend.chat(bubble.text, turn_id)
+
+    def _retry(self, bubble):
+        if bubble in self.resend:
+            self.resend.remove(bubble)
+        if not self.state.can_send:
+            bubble.set_receipt("queued")
+            self.resend.append(bubble)
+            return
+        if self.state.presence in ("thinking", "speaking"):
+            bubble.set_receipt("queued")
+            bubble.meta_label.setText("等她回答后再发")
+            self.outbox.append(bubble)
+            return
+        self._dispatch(bubble, resent=True)
+
+    def _accepted(self, turn_id):
+        turn = self.turns.get(turn_id)
+        if turn is not None:
+            turn["bubble"].set_receipt("resent" if turn["resent"] else "delivered")
+
+    def _chat_done(self, turn_id, text):
+        turn = self.turns.pop(turn_id, None)
+        if turn is None or turn_id != self.active_turn:
+            return
+        self.active_turn = None
+        clean = visible_text(text)
+        if not clean:
+            self.panel.chat.hide_thinking()
+            self.state.reply_arrived(turn_id, False)
+            self._flush_outbox()
+            return
+        segs = sentences(clean) or [clean]
+        bubble = self.panel.chat.add_reply(clean, segs)
+        bubble.stop.connect(self.stop)
+        bubble.resume.connect(self._resume)
+        bubble.replay.connect(lambda b: self._resume(b, 0))
+        speak = self.player is not None and self.prefs.get("voice_enabled")
+        if speak:
+            self._read(bubble, 0)
+        else:
+            bubble.set_mode("plain")
+        self.state.reply_arrived(turn_id, speak)
+        self._flush_outbox()
+
+    def _chat_failed(self, turn_id, reason, partial):
+        turn = self.turns.pop(turn_id, None)
+        if turn is None:
+            return
+        if turn_id == self.active_turn:
+            self.active_turn = None
+            self.panel.chat.hide_thinking()
+            self.state.turn_failed(turn_id)
+        bubble = turn["bubble"]
+        if reason == "offline":
+            # never reached the server: resend once when the link is back
+            bubble.set_receipt("failed")
+            if bubble not in self.resend:
+                self.resend.append(bubble)
+        elif reason == "rejected":
+            bubble.set_receipt("failed")
+            self.panel.composer.restore_draft(bubble.text)   # keep typed text on failure
+        else:  # the reply broke off midway
+            bubble.set_receipt("delivered")
+            clean = visible_text(partial)
+            if clean:
+                self.panel.chat.add_reply(clean, [clean]).set_mode("plain")
+            self.panel.chat.add_note("offline", "回复中断了，可以再问一次")
+        self._flush_outbox()
+
+    def _flush_outbox(self):
+        if (self.outbox and self.state.can_send and self.active_turn is None
+                and self.state.presence not in ("thinking", "speaking")):
+            bubble = self.outbox.pop(0)
+            self._dispatch(bubble)
+
+    # ------------------------------------------------------------ speech
+    def _read(self, bubble, start):
+        self.reading = bubble
+        if start == 0:
+            bubble.spoken_until = -1
+        self.reading_gen = self.backend.enqueue_speech(bubble.segments, start)
+
+    def _resume(self, bubble, start):
+        if self.player is None or not self.state.can_send:
+            return
+        if self.state.presence in ("thinking", "speaking"):
+            return
+        self._read(bubble, start)
+        bubble.set_mode("plain")
+
+    def _audio(self, generation, audio_id, index, sentence, wav, mouth):
+        if generation != self.backend.generation or self.player is None:
+            return
+        self.player.enqueue(audio_id, index, sentence, wav, mouth)
+
+    def _clip_started(self, clip):
+        bubble = self.reading
+        total = len(bubble.segments) if bubble is not None else 1
+        if bubble is not None:
+            bubble.set_current(clip.index)
+        self.state.segment_started(clip.index, total, clip.text)
+        if self.subtitles is not None:
+            self.subtitles.set_state("speaking", clip.text, 0.0)
+        if clip.mouth:
+            self.backend.sync("start", clip.audio_id, self.player.player.position())
+
+    def _clip_progress(self, clip, position, fraction):
+        self.state.segment_progress(fraction)
+        if clip.mouth:
+            self.backend.sync("position", clip.audio_id, position)
+
+    def _clip_finished(self, clip):
+        if clip.mouth:
+            self.backend.sync("stop", clip.audio_id)
+        bubble = self.reading
+        if bubble is not None:
+            bubble.segment_done(clip.index)
+            if clip.index >= len(bubble.segments) - 1:
+                bubble.current = -1
+                bubble.set_mode("plain")
+                self.reading = None
+                self._speech_done()
+
+    def _clip_failed(self, clip):
+        if clip.mouth:
+            self.backend.sync("stop", clip.audio_id)
+        self.backend.stop_speech()
+        self.player.stop()
+        self._speech_failed(clip.index)
+
+    def _speech_error(self, generation, index):
+        if generation != self.reading_gen:
+            return
+        self._speech_failed(index)
+
+    def _speech_failed(self, index):
+        bubble = self.reading
+        if bubble is not None:
+            if index <= 0 or bubble.spoken_until < 0:
+                bubble.set_mode("speech_failed")
+            else:
+                bubble.spoken_until = index - 1
+                bubble.set_mode("interrupted")
+        self._speech_done()
+
+    def _speech_done(self):
+        self.state.speech_finished()
+        if self.subtitles is not None:
+            self.subtitles.set_state("idle")
+
+    def stop_speech(self, collapse=False):
+        """Stop audio now, drop queued synthesis, clear the subtitle."""
+        self.backend.stop_speech()
+        clip = self.player.stop() if self.player is not None else None
+        if clip is not None and clip.mouth:
+            self.backend.sync("stop", clip.audio_id)
+        if self.subtitles is not None:
+            self.subtitles.set_state("interrupted")
+        return clip
+
+    def stop(self):
+        """Esc / stop key / tray: cancel thinking or stop speaking."""
+        if self.state.presence == "thinking" and self.active_turn is not None:
+            turn = self.turns.pop(self.active_turn, None)
+            outcome = self.backend.cancel(self.active_turn)
+            self.active_turn = None
+            self.panel.chat.hide_thinking()
+            if turn is not None:
+                turn["bubble"].meta_label.setText("已取消" if outcome == "cancelled" else "已取消 · 可能仍会回复")
+            self.stop_speech()
+            self.state.interrupted()
+            self._flush_outbox()
+            return
+        if self.state.presence in ("speaking", "thinking") or (self.player is not None and self.player.active):
+            playing = self.reading.current if self.reading is not None else -1
+            self.stop_speech()
+            if self.reading is not None:
+                self.reading.spoken_until = max(self.reading.spoken_until, playing)
+                self.reading.set_mode("interrupted")
+            self.state.interrupted()
+
+    # ------------------------------------------------------------ link
+    def _link_changed(self, state, attempt, next_ms):
+        self.state.set_connection(state, attempt, next_ms)
+        if state == "offline":
+            if self.state.presence != "idle" or self.reading is not None:
+                self.stop_speech()
+            self.server_enabled = False
+
+    def _link_up(self, base):
+        self.backend.set_base(base)
+        stamp = time.strftime("%H:%M")
+        self.panel.chat.add_note("idle", f"{stamp} 已重新连上")
+        self.panel.flash("idle", f"已重新连上 · {stamp}")
+        if self.periodic:
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "start")
+        pending, self.resend = self.resend, []
+        for bubble in pending:
+            if bubble is pending[0] and self.state.presence != "thinking":
+                self._dispatch(bubble, resent=True)
+            else:
+                bubble.set_receipt("queued")
+                bubble.meta_label.setText("等她回答后再发")
+                self.outbox.append(bubble)
+
+    def reconnect_now(self):
+        if self.link is not None:
+            self.link.connect_now()
+
+    # ------------------------------------------------------------ observation
+    def _sync_switches(self):
+        self.panel.popover.set_switches(self.periodic, False)
+        if self.settings is not None:
+            self.settings.set_observe_switches(self.periodic, False)
+        if self.tray is not None:
+            self.tray.set_checks(periodic=self.periodic, autonomous=False)
+        self.state.set_observe(periodic=self.periodic)
+
+    def set_periodic(self, on):
+        if on == self.periodic:
+            self._sync_switches()
+            return
+        if on and not self.prefs.get("consent_periodic"):
+            self._sync_switches()   # stays off until consent
+            self._ask_consent("periodic")
+            return
+        self._apply_periodic(on)
+
+    def set_autonomous(self, on):
+        # Today's server has no autonomous observation (P5); keep the switch off.
+        self._sync_switches()
+
+    def _ask_consent(self, kind):
+        dialog = ConsentDialog(self.panel, self.character, kind)
+        dialog.decided.connect(self._consent)
+        self.panel.popover.hide()
+        self.show_panel()
+        dialog.open()
+
+    def _consent(self, kind, accepted):
+        if accepted and kind == "periodic":
+            self.prefs.set("consent_periodic", True)
+            self._apply_periodic(True)
+        else:
+            self._sync_switches()
+
+    def _apply_periodic(self, on):
+        self.periodic = on
+        self.obs_timer.stop()
+        if on:
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "start")
+            self.guard.start()
+        elif not self.one_shot_stop.isActive():
+            # (a recent one-off look stays usable until its hold expires)
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "stop")
+            self.guard.stop()
+            self.server_enabled = False
+        self._sync_switches()
+
+    def look_now(self):
+        if not self.state.can_send:
+            self.panel.flash("offline", "连上以后才能看")
+            return
+        if self.one_shot_active:
+            return
+        self.one_shot_active = True
+        self.panel.popover.set_busy(True)
+        self.state.set_observe(capturing=True)
+        self.panel.chat.add_note("observing", f"{self.character.name}正在看当前窗口 · 只看这一次")
+        if self.server_enabled:
+            self.backend.screen(self.obs_gen, "observe")
+        else:
+            self.one_shot_pending = True
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "start")
+        self.guard.start()
+
+    def _observe_periodic(self):
+        if self.periodic and self.server_enabled:
+            self.state.set_observe(capturing=True)
+            self.backend.screen(self.obs_gen, "observe")
+
+    def _end_one_shot(self):
+        if not self.periodic:
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "stop")
+            self.server_enabled = False
+            self.guard.stop()
+
+    def _screen_result(self, generation, result):
+        if generation != self.obs_gen:
+            return
+        state = result.get("state") if isinstance(result, dict) else "error"
+        if state == "enabled":
+            self.server_enabled = True
+            if self.periodic:
+                self.obs_timer.start()
+            if self.one_shot_pending:
+                self.one_shot_pending = False
+                self.backend.screen(self.obs_gen, "observe")
+            return
+        if state == "disabled":
+            self.server_enabled = False
+            return
+        was_one_shot, self.one_shot_active = self.one_shot_active, False
+        self.panel.popover.set_busy(False)
+        self.state.set_observe(capturing=False)
+        if state in ("observed", "skipped", "waiting"):
+            self.panel.popover.add_result(state)
+            if was_one_shot:
+                text = {"observed": "看过了当前窗口", "skipped": "这个窗口被跳过了",
+                        "waiting": "刚看过，5 分钟内不会再看"}[state]
+                self.panel.chat.add_note("observing" if state == "observed" else "interrupted", text)
+                if not self.periodic:
+                    self.one_shot_stop.start(ONE_SHOT_HOLD_MS)
+            return
+        if state == "cancelled":
+            return
+        # error
+        self.panel.popover.add_result("failed")
+        self.one_shot_pending = False
+        if was_one_shot:
+            self.panel.chat.add_note("offline", "这次没看成，识屏暂不可用")
+        if self.periodic or self.server_enabled:
+            self._observation_off(reason="识屏暂不可用，已关闭观察")
+
+    def _observation_off(self, reason=None, notify=True):
+        was = self.periodic or self.server_enabled or self.one_shot_pending
+        self.periodic = False
+        self.one_shot_pending = self.one_shot_active = False
+        self.obs_timer.stop()
+        self.one_shot_stop.stop()
+        self.guard.stop()
+        if was:
+            self.obs_gen += 1
+            self.backend.screen(self.obs_gen, "stop")
+        self.server_enabled = False
+        self.state.set_observe(periodic=False, capturing=False)
+        self.panel.popover.set_busy(False)
+        self._sync_switches()
+        if notify and reason and was:
+            self.panel.chat.add_note("interrupted", reason)
+
+    def _guard(self):
+        if not (self.periodic or self.server_enabled or self.one_shot_pending):
+            self.guard.stop()
+            return
+        if desktop_locked():
+            self._observation_off(reason="电脑已锁屏，观察已关闭")
+        elif not vts_running():
+            self._observation_off(reason="VTube Studio 已退出，观察已关闭")
