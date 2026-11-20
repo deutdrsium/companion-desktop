@@ -83,8 +83,20 @@ _RECEIPT = {"task_id": string, "reason_code": nullable(string),
             "status": one_of(*RECEIPT_STATUSES), "occurred_at": utc,
             "evidence": nullable(shape({"source": string, "ref": string}))}
 _TURN = {"turn_id": string, "client_msg_id": string}
-_OBSERVE = {"request_id": string, "trigger": one_of("periodic", "autonomous", "user"),
+_TRIGGERS = ("periodic", "autonomous", "user")
+_OBSERVATION_RESULTS = ("observed", "skipped", "unchanged", "unavailable", "failed", "cancelled")
+_OBSERVE = {"request_id": string, "trigger": one_of(*_TRIGGERS),
             "range": one_of("active_window"), "permission_generation": positive}
+
+
+def observation_state(body):
+    return (fields(body, {"request_id": string, "source": one_of(*_TRIGGERS),
+                          "phase": one_of("requested", "capturing", "done"),
+                          "license_generation": positive, "captured_at": nullable(utc),
+                          "result": nullable(one_of(*_OBSERVATION_RESULTS))})
+            and (body["result"] is not None) == (body["phase"] == "done"))
+
+
 _MODEL = {"model_id": nullable(string), "asset_version": nullable(string), "revision": positive}
 _INTENT = {"task_id": string, "scope": one_of("avatar", "game"), "action": string,
            "params": obj, "ttl_ms": uint, "capability_revision": positive}
@@ -98,10 +110,18 @@ def intent(body):
                          "window_revision": positive})
 
 
-def receipt(body):
-    return (fields(body, _RECEIPT)
-            and (body["status"] != "completed" or body["evidence"] is not None)
+def result_valid(body):
+    return ((body["status"] != "completed" or body["evidence"] is not None)
             and (body["status"] != "unknown" or body["reason_code"] == "result_unknown"))
+
+
+def receipt(body):
+    return fields(body, _RECEIPT) and result_valid(body)
+
+
+def wardrobe_applied(body):
+    return (fields(body, {**_MODEL, **{key: check for key, check in _RECEIPT.items() if key != "task_id"}})
+            and result_valid(body))
 
 
 def cancel(body):
@@ -133,11 +153,11 @@ _CHECKS = {
     "cancel": cancel,
     "receipt": receipt,
     "observe": shape({**_OBSERVE, "ttl_ms": uint}),
-    "observation": shape({**_OBSERVE, "status": one_of("observed", "skipped", "unchanged", "unavailable",
-                           "failed", "cancelled"), "captured_at": nullable(utc), "source": string,
+    "observation": shape({**_OBSERVE, "status": one_of(*_OBSERVATION_RESULTS),
+                           "captured_at": nullable(utc), "source": string,
                            "result_ref": nullable(string)}),
     "wardrobe": shape({**_MODEL, "selection": nullable(obj), "mapping": nullable(obj), "updated_at": utc}),
-    "wardrobe_applied": shape({**_MODEL, **{key: check for key, check in _RECEIPT.items() if key != "task_id"}}),
+    "wardrobe_applied": wardrobe_applied,
     "turn.send": shape({"client_msg_id": string, "text": string}),
     "turn.accepted": shape(_TURN),
     "turn.failed": shape({**_TURN, "reason": string}),

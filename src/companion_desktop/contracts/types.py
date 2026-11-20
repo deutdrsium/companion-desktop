@@ -1,6 +1,6 @@
 """Public desktop session types."""
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, TypedDict
 
 PROTOCOL = "companion.desktop.v1"
 RECEIPT_STATUSES = (
@@ -24,16 +24,19 @@ class Message(TypedDict):
     body: dict[str, Any]
 
 
-class Capabilities(TypedDict):
+class _RequiredCapabilities(TypedDict):
     revision: int
     model_id: str | None
     asset_version: str | None
     avatar: dict[str, list]
     observations: list[str]
     games: list[dict[str, Any]]
-    tts: NotRequired[bool]
-    mouth: NotRequired[bool]
-    subtitle: NotRequired[bool]
+
+
+class Capabilities(_RequiredCapabilities, total=False):
+    tts: bool
+    mouth: bool
+    subtitle: bool
 
 
 class Connection(TypedDict):
@@ -42,6 +45,15 @@ class Connection(TypedDict):
     next_retry_ms: int | None
     generation: int | None
     reason: str | None
+
+
+class ObservationState(TypedDict):
+    request_id: str
+    source: Literal["periodic", "autonomous", "user"]
+    phase: Literal["requested", "capturing", "done"]
+    result: Literal["observed", "skipped", "unchanged", "unavailable", "failed", "cancelled"] | None
+    captured_at: str | None
+    license_generation: int
 
 
 class Evidence(TypedDict):
