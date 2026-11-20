@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Desktop model capabilities",
+  "description": "One local mapping for one VTS model and asset version. The loader also checks cross-references, ownership and input range order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "model_id", "asset_version", "inputs", "defaults", "expression_files", "activities", "outfits", "accessories", "expressions", "expression_overrides", "events"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "model_id": {"$ref": "#/$defs/id"},
+    "asset_version": {"$ref": "#/$defs/id"},
+    "inputs": {
+      "description": "Semantic names for procedural channels. Output endpoints preserve the input direction, including reversed axes.",
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "parameter", "input_range", "output_range"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "parameter": {"$ref": "#/$defs/id"},
+          "input_range": {"$ref": "#/$defs/endpoints"},
+          "output_range": {"$ref": "#/$defs/endpoints"}
+        }
+      }
+    },
+    "defaults": {"$ref": "#/$defs/parameterValues"},
+    "expression_files": {
+      "description": "Expressions owned by the mapping, with their overwrite values keyed by Live2D output ID.",
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/expressionFile"},
+      "additionalProperties": {"$ref": "#/$defs/parameterValues", "minProperties": 1}
+    },
+    "activities": {"$ref": "#/$defs/bindings", "description": "Mutually exclusive activity poses. Aliases may share a file."},
+    "outfits": {"$ref": "#/$defs/bindings", "description": "Mutually exclusive model outfit variants."},
+    "accessories": {"$ref": "#/$defs/bindings", "description": "Independently switchable outfit accessories."},
+    "expressions": {"$ref": "#/$defs/bindings", "description": "Sustained visual effects. Callers supply the current desired set."},
+    "expression_overrides": {
+      "description": "An effect can suppress other enabled effects which would compete with its outputs. Suppressed effects resume when the overriding effect is cleared. Overrides have one level.",
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/id"},
+        "uniqueItems": true,
+        "minItems": 1
+      }
+    },
+    "events": {
+      "description": "One-shot motion hotkeys. These bindings have no persistent state.",
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hotkey_id", "file", "duration_ms"],
+        "properties": {
+          "hotkey_id": {"$ref": "#/$defs/id"},
+          "file": {"type": "string", "pattern": "^[^/\\\\:]+\\.motion3\\.json$"},
+          "duration_ms": {"type": "integer", "minimum": 1}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "\\S"},
+    "endpoints": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+    "parameterValues": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {"type": "number"}
+    },
+    "expressionFile": {"type": "string", "pattern": "^[^/\\\\:]+\\.exp3\\.json$"},
+    "bindings": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/id"},
+      "additionalProperties": {"$ref": "#/$defs/expressionFile"}
+    }
+  }
+}
