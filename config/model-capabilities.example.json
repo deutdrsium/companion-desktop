@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "model_id": "model-demo",
+  "asset_version": "demo-v1",
+  "inputs": {
+    "head_pitch": {"id": "DemoPitchInput", "parameter": "DemoPitch", "input_range": [-25, 25], "output_range": [-10, 20]},
+    "look_x": {"id": "DemoGazeInput", "parameter": "DemoGaze", "input_range": [-1, 1], "output_range": [1, -1]}
+  },
+  "defaults": {
+    "DemoPose": 0,
+    "DemoOutfit": 0,
+    "DemoPin": 0,
+    "DemoShine": 1,
+    "DemoGlitter": 0,
+    "DemoCheeks": 0
+  },
+  "expression_files": {
+    "demo-idle.exp3.json": {"DemoPose": 0},
+    "demo-sketch.exp3.json": {"DemoPose": 1},
+    "demo-casual.exp3.json": {"DemoOutfit": 0},
+    "demo-jacket.exp3.json": {"DemoOutfit": 1},
+    "demo-pin.exp3.json": {"DemoPin": 1},
+    "demo-dim.exp3.json": {"DemoShine": 0},
+    "demo-glitter.exp3.json": {"DemoShine": 0.25, "DemoGlitter": 1},
+    "demo-cheeks.exp3.json": {"DemoCheeks": 1}
+  },
+  "activities": {
+    "idle": "demo-idle.exp3.json",
+    "sketching": "demo-sketch.exp3.json",
+    "drawing": "demo-sketch.exp3.json"
+  },
+  "outfits": {"casual": "demo-casual.exp3.json", "jacket": "demo-jacket.exp3.json"},
+  "accessories": {"pin": "demo-pin.exp3.json"},
+  "expressions": {"dim": "demo-dim.exp3.json", "glitter": "demo-glitter.exp3.json", "warm": "demo-cheeks.exp3.json"},
+  "expression_overrides": {"glitter": ["dim"]},
+  "events": {"spark": {"hotkey_id": "hotkey-demo-spark", "file": "demo-spark.motion3.json", "duration_ms": 800}}
+}
