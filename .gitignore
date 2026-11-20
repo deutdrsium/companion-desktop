@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Local configuration and secrets (commit *.example.* templates only)
+*.local.*
+.env
+.env.*
+!.env.example
+config/*.json
+config/*.yaml
+config/*.toml
+!config/*.example.*
+secrets/
+*.pem
+*.key
+
+# Personal assets and runtime data
+assets/private/
+*.moc3
+*.model3.json
+*.vtube.json
+*.zip
+data/
+logs/
+*.log
+recordings/
+screenshots/
+saves/
