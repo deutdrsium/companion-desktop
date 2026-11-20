@@ -1,9 +1,9 @@
 """Validate and route scoped intents to the local avatar and game executors."""
 
+import json
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-import json
 from time import monotonic
 from typing import Protocol
 

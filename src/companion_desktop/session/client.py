@@ -360,6 +360,10 @@ class DesktopSession(_SessionEvents):
                                observe_scopes=caps["observations"] if "observe" in self._grant else ())
         if self._connection["state"] != "connected":
             self._set_connection("connected", attempt=attempt, generation=ref["generation"])
+        if "speak" not in self._grant:
+            for client_id, turn_id in tuple(self._active_turns.items()):
+                self._receive_turn("turn.failed", {"client_msg_id": client_id, "turn_id": turn_id,
+                                                   "reason": "result_unknown"})
         for frame in incoming:
             body = frame["body"]
             if "ttl_ms" in body:
@@ -451,6 +455,10 @@ class DesktopSession(_SessionEvents):
             for turn_id in tuple(self._cancels):
                 self._emit("turn.cancelled", turn_id=turn_id, status="unknown", reason="result_unknown")
             self._cancels.clear()
+            if close_reason is not None:
+                for client_id, turn_id in tuple(self._active_turns.items()):
+                    self._receive_turn("turn.failed", {"client_msg_id": client_id, "turn_id": turn_id,
+                                                       "reason": "result_unknown"})
             self._set_connection("closed", reason=close_reason)
 
     async def _best_effort_disconnect(self):

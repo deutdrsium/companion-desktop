@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
+from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 from companion_desktop.contracts.types import PROTOCOL
 from companion_desktop.contracts.wire import ProtocolError, message
 from companion_desktop.session.client import DesktopSession

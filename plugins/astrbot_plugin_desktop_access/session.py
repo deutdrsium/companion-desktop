@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 from collections import OrderedDict, deque
+from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from time import monotonic
@@ -56,8 +57,6 @@ class _Claims:
         if self.path is None:
             key = (binding, client_msg_id)
             return self.memory.setdefault(key, proposed) if proposed is not None else self.memory.get(key)
-        from contextlib import closing
-
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS desktop_turns (binding TEXT, client_id TEXT, "
                        "fingerprint TEXT NOT NULL, turn_id TEXT NOT NULL, PRIMARY KEY (binding, client_id))")
@@ -96,6 +95,7 @@ class _Connection:
     capabilities: dict | None = None
     windows: dict = field(default_factory=dict)
     intents: dict = field(default_factory=dict)
+    observations: dict = field(default_factory=dict)
     pending: deque = field(default_factory=deque)
     snapshots: dict = field(default_factory=dict)
     wardrobe_receipt: dict | None = None
@@ -162,6 +162,10 @@ class SessionHost:
         removed = connection.permissions - permissions
         if removed:
             self._invalidate_scopes(connection, removed, "unauthorized")
+            if "observe" in removed:
+                connection.observations.clear()
+            if "avatar" in removed:
+                connection.wardrobe_receipt = None
             connection.snapshots.clear()
             if "speak" in removed:
                 for (key, _), turn in self._turns.items():
@@ -211,6 +215,8 @@ class SessionHost:
         self._invalidate_scopes(connection, {"avatar", "game"}, "capabilities_changed")
         connection.capabilities = deepcopy(body)
         connection.windows.clear()
+        if current is not None and body["observations"] != current["observations"]:
+            connection.observations.clear()
         connection.snapshots.clear()
         connection.wardrobe_receipt = None
 
@@ -329,7 +335,11 @@ class SessionHost:
             raise ProtocolError("missing_dependency")
         if len(connection.pending) >= BATCH_LIMIT:
             raise ProtocolError("busy")
-        connection.pending.append(("observe", (frame, self.clock() + body["ttl_ms"] / 1000)))
+        request_id = body["request_id"]
+        if request_id in connection.observations:
+            raise ProtocolError("invalid_config")
+        deadline = self.clock() + body["ttl_ms"] / 1000
+        connection.pending.append(("observe", (frame, deadline)))
 
     def _receipt(self, connection, body):
         intent = connection.intents.get(body["task_id"])
@@ -374,9 +384,12 @@ class SessionHost:
             if kind == "observe":
                 frame, deadline = payload
                 remaining = int((deadline - self.clock()) * 1000)
+                body = frame["body"]
                 if (remaining > 0 and "observe" in connection.permissions
-                        and frame["body"]["range"] in connection.capabilities["observations"]):
-                    frames.append({**frame, "body": {**frame["body"], "ttl_ms": remaining}})
+                        and body["range"] in connection.capabilities["observations"]
+                        and body["request_id"] not in connection.observations):
+                    connection.observations[body["request_id"]] = (body, deadline)
+                    frames.append({**frame, "body": {**body, "ttl_ms": remaining}})
                 continue
             intent = connection.intents[payload]
             if intent.result["status"] in TERMINAL_STATUSES:
@@ -425,12 +438,14 @@ class SessionHost:
         if backend is None or "speak" not in connection.permissions or len(client_id) > 128 or len(text) > 4000:
             reason = "unauthorized" if backend is None or "speak" not in connection.permissions else "invalid_request"
             return message("turn.failed", ref, {"client_msg_id": client_id, "turn_id": client_id, "reason": reason})
-        if any(owner == key and other_id != client_id and turn.result is None
-               for (owner, other_id), turn in self._turns.items()):
-            return message("turn.failed", ref, {"client_msg_id": client_id, "turn_id": client_id, "reason": "busy"})
         proposed = uuid4().hex
         fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        original, turn_id = self._claims.claim(key, client_id, fingerprint, proposed)
+        claim = self._claims.lookup(key, client_id)
+        if claim is None:
+            if any(owner == key and turn.result is None for (owner, _), turn in self._turns.items()):
+                return message("turn.failed", ref, {"client_msg_id": client_id, "turn_id": client_id, "reason": "busy"})
+            claim = self._claims.claim(key, client_id, fingerprint, proposed)
+        original, turn_id = claim
         ids = {"client_msg_id": client_id, "turn_id": turn_id}
         if original != fingerprint:
             return message("turn.failed", ref, {**ids, "reason": "invalid_config"})
@@ -522,12 +537,23 @@ class SessionHost:
                 if (caps is not None and body["revision"] == connection.snapshots.get("wardrobe")
                         and all(body[key] == caps[key] for key in ("model_id", "asset_version"))):
                     connection.wardrobe_receipt = deepcopy(body)
-            elif kind == "observation" and "observe" in connection.permissions and on_message is not None:
-                on_message(frame)
+            elif kind == "observation" and "observe" in connection.permissions:
+                pending = connection.observations.get(body["request_id"])
+                if pending is not None:
+                    original, deadline = pending
+                    if self.clock() < deadline and all(body[key] == original[key] for key in
+                                                       ("trigger", "range", "permission_generation")):
+                        del connection.observations[body["request_id"]]
+                        if on_message is not None:
+                            on_message(frame)
         if operation == "disconnect":
             self._retire(connection, "disconnected")
             return {}
         self._refresh(connection)
+        now = self.clock()
+        for request_id, (_, deadline) in tuple(connection.observations.items()):
+            if now >= deadline:
+                del connection.observations[request_id]
         for client_id in sorted(requested) if "speak" in connection.permissions else ():
             frame = self._turn_frame(connection, client_id)
             if frame is not None:

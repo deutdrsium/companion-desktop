@@ -61,4 +61,4 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest discover -s tests -p 'test_desktop*.py' -v
         env:
-          PYTHONPATH: src:plugins
+          PYTHONPATH: src:.
