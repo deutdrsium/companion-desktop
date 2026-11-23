@@ -1,10 +1,12 @@
 """B04/B05 desk entry replay with synthetic player samples and VTS readback."""
 
 from array import array
+import asyncio
 import io
 import time
 import wave
 
+import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from companion_desktop.client.controller import Controller
@@ -15,7 +17,8 @@ from companion_desktop.contracts.wire import message
 from companion_desktop.ui.paint import Character
 from fakes import FakePlayer, FakeSubtitles
 from test_desktop_animation import Rig
-from test_controller import replies
+from test_controller import replies, users
+from test_desktop_session import FakeChat
 from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 
 
@@ -205,5 +208,75 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
         backend._request = lambda *args, **kwargs: None
         backend.close(1)
         controller.quitting = True
+        controller.panel.close()
+        controller.panel.deleteLater()
+
+
+@pytest.mark.parametrize("lose_ack", [True, False])
+def test_device_turn_delivers_once_after_reconnect(qapp, prefs, tmp_path, lose_ack):
+    cfg = {"server": {"api_path": "/desktop"}, "account": {"username": "demo", "session_id": "demo"},
+           "avatar": {"mapping": ""}}
+    backend = DeviceBackend("http://127.0.0.1:1", "synthetic-key", cfg, tmp_path)
+    backend.history_ready = True
+    backend._request = lambda *args, **kwargs: None
+    prefs.set("voice_enabled", False)
+    controller = Controller(Character("Demo"), "Demo", prefs, backend, device=True)
+
+    async def wait_for(condition):
+        async with asyncio.timeout(2):
+            while not condition():
+                await asyncio.sleep(0.01)
+
+    async def exercise():
+        clock = [0]
+        host = SessionHost(clock=lambda: clock[0])
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+        chat = FakeChat()
+        sends = []
+
+        async def transport(operation, payload):
+            result = host.handle(binding, operation, payload, turns=chat)
+            for frame in payload.get("messages", ()):
+                if frame["type"] == "turn.send":
+                    sends.append(frame["body"]["client_msg_id"])
+                    if lose_ack and len(sends) == 1:
+                        raise ConnectionError("connection_lost")
+            return result
+
+        session = backend.session
+        session._transport = transport
+        session._poll_interval = 0.01
+        session.start()
+        try:
+            await wait_for(lambda: session.connection["state"] == "connected")
+            generation = session.session["generation"]
+            controller.send("Example message")
+            client_id = controller.active_turn
+            bubble = users(controller)[0]
+            if not lose_ack:
+                await wait_for(lambda: bubble.receipt == "delivered")
+                clock[0] += host.lease_seconds  # The next poll finds the generation expired.
+            await wait_for(lambda: session.connection["state"] == "reconnecting")
+            assert session.connection["reason"] == ("connection_lost" if lose_ack else "stale_session")
+            assert controller.active_turn == client_id
+            await wait_for(lambda: session.connection["state"] == "connected" and bubble.receipt == "delivered")
+            assert session.session["generation"] > generation
+            assert controller.state.presence == "thinking"
+            chat.result.set_result(TurnResult("completed", "Example reply."))
+            await wait_for(lambda: bool(replies(controller)))
+            assert [bubble.text for bubble in replies(controller)] == ["Example reply."]
+            assert controller.active_turn is None
+            assert sends == [client_id] * (2 if lose_ack else 1)
+            assert len(chat.calls) == 1 and not chat.cancelled
+        finally:
+            await session.close()
+            if not chat.result.done():
+                chat.result.set_result(TurnResult("failed"))
+
+    try:
+        backend.loop.run_until_complete(exercise())
+    finally:
+        controller.quitting = True
+        backend.close(1)
         controller.panel.close()
         controller.panel.deleteLater()

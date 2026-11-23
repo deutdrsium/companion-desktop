@@ -58,8 +58,7 @@ class DeviceBackend(LegacyBackend):
     async def _transport(self, operation, payload):
         endpoint = self.base + self.api + "/session"
         if self.transport is None or self.transport.endpoint != endpoint:
-            # The host loop can stall for seconds under load; a short timeout
-            # turns that into a reconnect that cancels the reply in flight.
+            # Allow for multi-second stalls on the host event loop.
             self.transport = HttpTransport(endpoint, self.key, timeout=30)
         return await self.transport(operation, payload)
 

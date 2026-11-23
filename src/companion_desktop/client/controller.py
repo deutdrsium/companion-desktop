@@ -622,7 +622,11 @@ class Controller(QObject):
 
     def _device_connection(self, event):
         self.state.apply_event(event)
-        if event["state"] != "connected" and not self.quitting:
+        if self.active_turn is not None:
+            # The session reconciles pending sends and accepted turns after reconnect.
+            if event["state"] == "connected" and self.state.presence != "thinking":
+                self.state.turn_sent(self.active_turn)
+        elif event["state"] != "connected" and not self.quitting:
             self.stop()
 
     # ------------------------------------------------------------ link
