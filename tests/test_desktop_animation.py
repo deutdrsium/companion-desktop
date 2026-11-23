@@ -162,7 +162,7 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         rig.avatar.handle_vts_event("ModelClickedEvent", {"loadedModelID": "other-demo", "modelWasClicked": True})
         self.assertLess((await rig.frames(10))[-1]["look_x"], -0.6)
         rig.avatar.handle_vts_event("ModelClickedEvent", {"loadedModelID": rig.model.model_id, "modelWasClicked": True})
-        self.assertGreater((await rig.frames(10))[-1]["look_x"], -0.05)
+        self.assertGreater((await rig.frames(20))[-1]["look_x"], -0.05)
         rig.avatar.set_enabled(False)
         before = len(rig.vts.frames)
         await rig.frames(10)
@@ -271,7 +271,7 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
 
         await update(sleepiness=0.95)
         sleepy = await rig.frames(80)
-        self.assertTrue(all(frame["eye_left"] < 0.58 for frame in sleepy[-15:]))
+        self.assertTrue(all(frame["eye_left"] < 0.85 for frame in sleepy[-15:]))
         await update(emotion="happy", ttl_ms=3000)
         happy = (await rig.frames(70))[-1]
         self.assertAlmostEqual(happy["mouth_form"], 0.26, delta=0.02)

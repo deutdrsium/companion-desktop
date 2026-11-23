@@ -26,6 +26,9 @@ class DeviceBackend(LegacyBackend):
         self.timer = QTimer(self)
         self.timer.setInterval(10)
         self.timer.timeout.connect(self._pump)
+        self.cursor_timer = QTimer(self)
+        self.cursor_timer.setInterval(80)
+        self.cursor_timer.timeout.connect(self._cursor)
         self.avatar = self.vts = self.catalog = None
         self.revision = 1
         self.cues = {}
@@ -55,7 +58,8 @@ class DeviceBackend(LegacyBackend):
     async def _transport(self, operation, payload):
         endpoint = self.base + self.api + "/session"
         if self.transport is None or self.transport.endpoint != endpoint:
-            self.transport = HttpTransport(endpoint, self.key)
+            # Allow for multi-second stalls on the host event loop.
+            self.transport = HttpTransport(endpoint, self.key, timeout=30)
         return await self.transport(operation, payload)
 
     def _publish(self):
@@ -93,6 +97,8 @@ class DeviceBackend(LegacyBackend):
     def load_history(self):
         self.loop.create_task(self._start())
         self.timer.start()
+        if self.avatar:
+            self.cursor_timer.start()
         super().load_history()
 
     def reconnect_session(self):
@@ -153,13 +159,16 @@ class DeviceBackend(LegacyBackend):
             client_id = event["client_msg_id"]
             accepted = self.turn_ids.pop(client_id, None) is not None
             self.cancel_pending.discard(client_id)
-            reason = "interrupted" if accepted else "rejected"
+            reason = event["reason"]
+            if reason != "busy":
+                reason = "interrupted" if accepted else "rejected"
             self.chat_failed.emit(client_id, reason, "")
         elif kind == "turn.cancelled" and event["status"] == "cancelled":
             for client_id, turn_id in tuple(self.turn_ids.items()):
                 if turn_id == event["turn_id"]:
                     self.turn_ids.pop(client_id, None)
                     self.cues.pop(turn_id, None)
+                    self.chat_failed.emit(client_id, "cancelled", "")
 
     def _complete(self, event):
         self.chat_done.emit(event["client_msg_id"], event["text"])
@@ -170,8 +179,22 @@ class DeviceBackend(LegacyBackend):
         turn_id = self.turn_ids.get(client_id)
         return turn_id, self.cues.pop(turn_id, ())
 
+    def _cursor(self):
+        """Feed the desktop cursor, relative to its screen centre, to gaze following."""
+        from PyQt5.QtGui import QCursor, QGuiApplication
+
+        position = QCursor.pos()
+        screen = QGuiApplication.screenAt(position)
+        if screen is None:
+            return
+        rect = screen.geometry()
+        x = (position.x() - rect.center().x()) / max(1, rect.width() / 2)
+        y = (position.y() - rect.center().y()) / max(1, rect.height() / 2)
+        self.avatar.pointer((max(-1.0, min(1.0, x)), max(-1.0, min(1.0, y))))
+
     def close(self, generation):
         self.timer.stop()
+        self.cursor_timer.stop()
         if not self.loop.is_closed():
             async def finish():
                 for task in self.tasks:
