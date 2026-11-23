@@ -154,26 +154,37 @@ class Launch(QObject):
         self.link.adopt(base, process)
         self.card.set_step(2)
         folder = config_mod.data_dir(cfg)
-        backend = LegacyBackend(base, self._key, cfg)
+        device = cfg["server"].get("device_session") is True
         prefs = Prefs()
+        sub = cfg["subtitle"]
+        if sub.get("enabled", True):
+            try:
+                token = sub.get("token_file") or str(folder / "subtitle-token")
+                self.subtitles = SubtitleServer(token, int(sub.get("port", 18676)), self.character.name,
+                                                cfg["character"].get("voice_font") or None)
+                (folder / "subtitle-item-url").write_text(self.subtitles.item_url, encoding="utf-8")
+            except Exception:
+                log.exception("subtitle server unavailable")
+                self.subtitles = None
         try:
-            sub = cfg["subtitle"]
-            token = sub.get("token_file") or str(folder / "subtitle-token")
-            self.subtitles = SubtitleServer(token, int(sub.get("port", 18676)), self.character.name,
-                                            cfg["character"].get("voice_font") or None)
-            (folder / "subtitle-item-url").write_text(self.subtitles.item_url, encoding="utf-8")
-        except Exception:
-            log.exception("subtitle server unavailable")
-            self.subtitles = None
-        try:
-            player = Player()
+            player = Player(local_levels=device)
         except Exception:
             log.exception("audio unavailable")
             player = None
+        barge_in = None
+        if device:
+            from .device_backend import DeviceBackend
+            backend = DeviceBackend(base, self._key, cfg, folder, tts=player is not None,
+                                    subtitle=self.subtitles is not None)
+            if player is not None and cfg.get("headset_barge_in") is True:
+                from .barge_in import BargeIn
+                barge_in = BargeIn()
+        else:
+            backend = LegacyBackend(base, self._key, cfg)
         rhythm = RhythmService(cfg["rhythm_command"]) if cfg.get("rhythm_command") else None
         voice = VoiceKeyService(cfg["voice_key_command"]) if cfg.get("voice_key_command") else None
         c = Controller(self.character, cfg["title"], prefs, backend, self.link, player, self.subtitles,
-                       rhythm, voice, folder / "logs", None, __version__)
+                       rhythm, voice, folder / "logs", None, __version__, device=device, barge_in=barge_in)
         c.attach_tray(Tray(self.character, cfg["title"], c.state))
         self.controller = c
         geometry = prefs.store.value("geometry")

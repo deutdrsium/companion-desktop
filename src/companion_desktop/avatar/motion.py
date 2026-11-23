@@ -22,7 +22,7 @@ THINKING = {
 }
 LISTENING = {"brow_left": 0.15, "brow_right": 0.13, "head_roll": 1.8}
 LAUGH = {"eye_left": 0.72, "eye_right": 0.72, "eye_smile": 0.85, "mouth_form": 0.87}
-GESTURE_SECONDS = {"hold_laugh": 2.8, "nod": 0.65}
+GESTURE_SECONDS = {"hold_laugh": 2.8, "nod": 0.65, "head_tilt": 1.05}
 
 
 def unit(value):
@@ -200,6 +200,11 @@ class Motion:
         if nod is not None:
             phase = unit((now - nod.started) / nod.duration)
             targets["head_pitch"] -= 8.0 * nod.strength * sin(phase * pi) ** 2
+
+        tilt = gestures.get("head_tilt")
+        if tilt is not None:
+            phase = unit((now - tilt.started) / tilt.duration)
+            targets["head_roll"] += 7.0 * tilt.strength * sin(phase * pi) ** 2
 
         if self._reflex is not None:
             start, duration, gaze = self._reflex

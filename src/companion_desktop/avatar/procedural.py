@@ -57,6 +57,8 @@ class ProceduralAvatar:
             actions["hold_laugh"] = bindings["mouth_form"].input_id
         if "head_pitch" in bindings:
             actions["nod"] = bindings["head_pitch"].input_id
+        if "head_roll" in bindings:
+            actions["head_tilt"] = bindings["head_roll"].input_id
         return actions
 
     def capabilities(self, revision):
@@ -100,6 +102,20 @@ class ProceduralAvatar:
             self.motion.reply_smile_until = 0.0
         self._revision += 1
         report(OutputResult("accepted"))
+
+    def play_cue(self, cue, report):
+        self._sync_model()
+        observed = self.output.observed
+        generation = self.output.generation
+        self.start({**cue, "model_id": observed.model_id if observed else None},
+                   deadline=self.clock() + 5, is_current=lambda: generation == self.output.generation,
+                   report=report)
+
+    def end_conversation(self):
+        self._client_id = self._turn_id = None
+        self.motion.thinking = False
+        self.motion.reply_smile_until = 0.0
+        self.stop_mouth()
 
     def cancel(self, intent, reason):
         action = intent["action"]
@@ -216,6 +232,7 @@ class ProceduralAvatar:
         for action, gesture in tuple(self._gestures.items()):
             if not gesture.is_current() or now >= gesture.deadline:
                 del self._gestures[action]
+                gesture.report(OutputResult("cancelled", "no_time_window", _effect_ref(gesture.task_id)))
         gestures = self._gestures.copy()
         frame = self.motion.advance(elapsed, now, gestures)
         batch_time = None
