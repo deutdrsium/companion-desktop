@@ -79,14 +79,15 @@ class Motion:
             return
         if max(abs(a - b) for a, b in zip(previous, position)) >= 0.18:
             self._next_pointer = self.time + self._delay(3.5, 1.8)
-            self._reflex = (self.time, 0.65, tuple(0.42 * (2 * unit((n + 1) / 2) - 1) for n in position))
+            self._reflex = (self.time, 0.65, tuple(0.42 * (2 * unit((n + 1) / 2) - 1) for n in position), 0.10, 0.20)
 
     def click(self):
         if self.time < self._next_click:
             return
-        self._next_click = self.time + 0.9
+        self._next_click = self.time + 1.4
         self._next_pointer = self.time + 1.0
-        self._reflex = (self.time, 0.9, (0.0, 0.08))
+        # A click is a soft glance back, not a snap.
+        self._reflex = (self.time, 1.4, (0.0, 0.06), 0.30, 0.45)
 
     def blink(self):
         self._blink_start = self.time
@@ -168,21 +169,21 @@ class Motion:
         sway = (1 + 0.35 * happiness) * (1 - 0.34 * fatigue)
         targets = {
             "head_yaw": sway * (1.3 * sin(0.67 * t) + 0.36 * sin(1.07 * t + 0.8)),
-            "head_pitch": 0.7 * sin(0.50 * t + 2.1) - 2.4 * reading - 3.0 * fatigue,
+            "head_pitch": 0.7 * sin(0.50 * t + 2.1) - 2.4 * reading - 1.5 * fatigue,
             "head_roll": 0.52 * sin(0.43 * t + 0.6) + 0.3 * self._weight_shift,
             "body_yaw": 0.78 * sway * sin(0.37 * t + 2.0) + self._weight_shift,
             "body_roll": 0.45 * sway * sin(0.29 * t + 0.5) + 0.5 * self._weight_shift,
             "breath": 0.50 - 0.42 * cos(1.38 * t),
             "look_x": self._gaze[0], "look_y": self._gaze[1] - 0.39 * reading - 0.12 * fatigue,
-            "eye_left": 1 - 0.50 * fatigue, "eye_right": 1 - 0.50 * fatigue,
+            "eye_left": 1 - 0.22 * fatigue, "eye_right": 1 - 0.22 * fatigue,
             "brow_left": -0.14 * fatigue, "brow_right": -0.14 * fatigue,
             "eye_smile": 0.17 * happiness, "mouth_form": 0.26 * happiness,
             "mouth_open": self.mouth_target,
         }
         if self.thinking:
             targets.update(THINKING)
-            targets["eye_left"] *= 0.93
-            targets["eye_right"] *= 0.93
+            targets["eye_left"] *= 0.97
+            targets["eye_right"] *= 0.97
         elif self.typing:
             targets.update(LISTENING)
 
@@ -207,19 +208,19 @@ class Motion:
             targets["head_roll"] += 7.0 * tilt.strength * sin(phase * pi) ** 2
 
         if self._reflex is not None:
-            start, duration, gaze = self._reflex
+            start, duration, gaze, rise, fall = self._reflex
             age = t - start
             if age >= duration:
                 self._reflex = None
             else:
-                weight = ease(age / 0.10) * ease((duration - age) / 0.20)
+                weight = ease(age / rise) * ease((duration - age) / fall)
                 for channel, goal in zip(("look_x", "look_y"), gaze):
                     targets[channel] += weight * (goal - targets[channel])
 
         for channel, goal in targets.items():
             speed = 8.0
             if channel.startswith("look_"):
-                speed = 23.0
+                speed = 12.0 if self._reflex is not None and self._reflex[3] > 0.2 else 23.0
             elif channel.startswith("body_"):
                 speed = 3.0
             elif channel.startswith("head_"):
