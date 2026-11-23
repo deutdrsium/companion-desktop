@@ -1,0 +1,37 @@
+{
+  "protocol": "companion.desktop.v1",
+  "session": {"device_id": "dev-demo", "desktop_session_id": "desk-demo", "generation": 4},
+  "cases": [
+    {
+      "name": "supported_or_missing_resource",
+      "intent": {"task_id": "t-demo-a", "scope": "avatar", "action": "nod", "params": {"intensity": 0.5}, "ttl_ms": 900, "capability_revision": 3, "model_id": "model-demo", "utterance_id": "u-demo", "segment_id": "seg-2"},
+      "receipts": [
+        {"task_id": "t-demo-a", "status": "accepted", "reason_code": null, "evidence": null, "occurred_at": "2026-01-01T12:00:00Z"},
+        {"task_id": "t-demo-a", "status": "unsupported", "reason_code": "missing_dependency", "evidence": {"source": "vts_capabilities", "ref": "cap-demo-3"}, "occurred_at": "2026-01-01T12:00:00Z"}
+      ]
+    },
+    {
+      "name": "game_accepted_then_completed",
+      "receipts": [
+        {"task_id": "t-demo-move", "status": "accepted", "reason_code": null, "evidence": {"source": "neuro.action/result", "ref": "neuro-demo-8"}, "occurred_at": "2026-01-01T12:01:00Z"},
+        {"task_id": "t-demo-move", "status": "completed", "reason_code": null, "evidence": {"source": "game_state", "ref": "position-demo-9"}, "occurred_at": "2026-01-01T12:01:04Z"}
+      ]
+    },
+    {
+      "name": "cancelled_or_unknown",
+      "cancel": {"task_id": "t-demo-water", "reason_code": "cancelled"},
+      "receipts": [
+        {"task_id": "t-demo-water", "status": "cancelled", "reason_code": "cancelled", "evidence": {"source": "game_stop_readback", "ref": "stopped-demo-11"}, "occurred_at": "2026-01-01T12:02:01Z"},
+        {"task_id": "t-demo-water", "status": "unknown", "reason_code": "result_unknown", "evidence": null, "occurred_at": "2026-01-01T12:02:01Z"}
+      ]
+    },
+    {
+      "name": "current_or_expired_window",
+      "intent": {"task_id": "t-demo-card", "scope": "game", "action": "play_card", "params": {"card": "card-demo"}, "ttl_ms": 900, "capability_revision": 3, "game_session_id": "game-demo", "window_id": "window-demo", "window_revision": 2},
+      "receipts": [
+        {"task_id": "t-demo-card", "status": "queued", "reason_code": null, "evidence": null, "occurred_at": "2026-01-01T12:03:00Z"},
+        {"task_id": "t-demo-card", "status": "expired", "reason_code": "no_time_window", "evidence": {"source": "game_window", "ref": "window-demo-3"}, "occurred_at": "2026-01-01T12:03:01Z"}
+      ]
+    }
+  ]
+}
