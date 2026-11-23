@@ -485,6 +485,8 @@ class DesktopSession(_SessionEvents):
                 self.dispatcher.disconnect()
                 await self._best_effort_disconnect()
             self._drop("closed")
+            # Failure callbacks may try to dispatch the next queued message.
+            self._set_connection("closed", reason=close_reason)
             for client_id in tuple(self._sends):
                 self._emit("turn.failed", client_msg_id=client_id, turn_id=None, reason="disconnected")
             self._sends.clear()
@@ -495,7 +497,6 @@ class DesktopSession(_SessionEvents):
                 for client_id, turn_id in tuple(self._active_turns.items()):
                     self._receive_turn("turn.failed", {"client_msg_id": client_id, "turn_id": turn_id,
                                                        "reason": "result_unknown"})
-            self._set_connection("closed", reason=close_reason)
 
     async def _best_effort_disconnect(self):
         try:
