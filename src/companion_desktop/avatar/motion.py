@@ -20,7 +20,8 @@ THINKING = {
     "head_roll": -5.5, "look_x": -0.63, "look_y": 0.37,
     "brow_left": -0.46, "brow_right": 0.20, "mouth_form": -0.52,
 }
-LISTENING = {"brow_left": 0.15, "brow_right": 0.13, "head_roll": 1.8}
+LISTENING = {"brow_left": 0.38, "brow_right": 0.34, "head_roll": 4.5, "head_pitch": 2.0}
+FOLLOW_SECONDS = 2.5  # how long gaze keeps following after the pointer stops
 LAUGH = {"eye_left": 0.72, "eye_right": 0.72, "eye_smile": 0.85, "mouth_form": 0.87}
 GESTURE_SECONDS = {"hold_laugh": 2.8, "nod": 0.65, "head_tilt": 1.05}
 
@@ -66,6 +67,7 @@ class Motion:
         self._lid = 1.0
         self._reflex = None
         self._last_pointer = None
+        self._follow = None  # (position, seen_at) of the latest desktop pointer
         self._next_pointer = 0.0
         self._next_click = 0.0
 
@@ -75,6 +77,8 @@ class Motion:
     def pointer(self, position):
         """Accept mapped model-window coordinates in [-1, 1], or None outside it."""
         previous, self._last_pointer = self._last_pointer, position
+        if position is not None and position != previous:
+            self._follow = (position, self.time)
         if position is None or previous is None or self.time < self._next_pointer:
             return
         if max(abs(a - b) for a, b in zip(previous, position)) >= 0.18:
@@ -180,6 +184,13 @@ class Motion:
             "eye_smile": 0.17 * happiness, "mouth_form": 0.26 * happiness,
             "mouth_open": self.mouth_target,
         }
+        if self._follow is not None and t - self._follow[1] < FOLLOW_SECONDS and not self.thinking:
+            (px, py), seen = self._follow
+            weight = ease((FOLLOW_SECONDS - (t - seen)) / 0.8)
+            targets["look_x"] += weight * (0.75 * px - targets["look_x"])
+            targets["look_y"] += weight * (-0.6 * py - targets["look_y"])
+            targets["head_yaw"] += weight * 9.0 * px
+            targets["head_pitch"] += weight * -5.0 * py
         if self.thinking:
             targets.update(THINKING)
             targets["eye_left"] *= 0.97
