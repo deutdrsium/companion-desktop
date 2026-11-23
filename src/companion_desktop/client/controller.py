@@ -17,8 +17,9 @@ from ..ui.observe import ConsentDialog
 from ..ui.panel import Panel
 from ..ui.session_state import SessionState
 from ..ui.settings import SettingsWindow
+from .audio import PcmClip
 from .protocol import desktop_locked, sentences, visible_text, vts_running
-from .timeline import CueTrack, LEVEL_INTERVAL_MS
+from .timeline import CueTrack
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +108,8 @@ class Controller(QObject):
             b.connection.connect(self._device_connection)
             b.utterance_cancelled.connect(self._utterance_cancelled)
             b.voice_revoked.connect(self._voice_revoked)
+            b.pcm.connect(self._pcm)
+            b.pcm_lost.connect(self._pcm_lost)
         if self.link is not None:
             b.unreachable.connect(self.link.lost)
             self.link.changed.connect(self._link_changed)
@@ -434,11 +437,22 @@ class Controller(QObject):
             return
         self.player.enqueue(audio_id, index, sentence, wav, mouth)
 
+    def _pcm(self, generation, clip):
+        if generation == self.backend.generation and self.player is not None:
+            self.player.enqueue_pcm(clip)
+
+    def _pcm_lost(self, generation, clip):
+        if generation == self.backend.generation and self.player is not None:
+            if self.player.current is clip and self.barge_in is not None:
+                self.barge_in.stop()
+            self.player.discard_pcm(clip)
+
     def _clip_started(self, clip):
         if self.avatar is not None:
             self.avatar.end_conversation()
         if self.device and clip.duration_ms > 0:
-            self._advance_cues(clip.index, clip.text, clip.audio_id, self.player.player.position(), clip.duration_ms)
+            position = 0 if isinstance(clip, PcmClip) else self.player.player.position()
+            self._advance_cues(clip.index, clip.text, clip.audio_id, position, clip.duration_ms)
         if self.barge_in is not None:
             self.barge_in.start()
         bubble = self.reading
@@ -455,8 +469,7 @@ class Controller(QObject):
         self.state.segment_progress(fraction)
         if self.device:
             if self.avatar is not None:
-                index = position // LEVEL_INTERVAL_MS
-                self.avatar.mouth_level(clip.levels[index] if 0 <= index < len(clip.levels) else 0)
+                self.avatar.mouth_level(clip.level_at(position))
             if clip.duration_ms > 0:
                 self._advance_cues(clip.index, clip.text, clip.audio_id, position, clip.duration_ms)
         elif clip.mouth:
@@ -483,6 +496,17 @@ class Controller(QObject):
                 self._speech_done()
 
     def _clip_failed(self, clip):
+        if isinstance(clip, PcmClip) and self.reading is not None:
+            # The local PCM output failed. Retry from this sentence on the existing WAV path.
+            self.backend.stop_speech()
+            self.backend.disable_pcm()
+            if self.avatar is not None:
+                self.avatar.stop_mouth()
+            if self.barge_in is not None:
+                self.barge_in.stop()
+            self.player.stop()
+            self.reading_gen = self.backend.enqueue_speech(self.reading.segments, clip.index)
+            return
         if self.device:
             self.stop_speech()
         else:
@@ -524,11 +548,11 @@ class Controller(QObject):
         self.backend.stop_speech()
         if self.barge_in is not None:
             self.barge_in.stop()
-        clip = self.player.stop() if self.player is not None else None
         if self.device:
             self.reading_gen = None
             self._release_presentation()
-        elif clip is not None and clip.mouth:
+        clip = self.player.stop() if self.player is not None else None
+        if not self.device and clip is not None and clip.mouth:
             self.backend.sync("stop", clip.audio_id)
         if self.subtitles is not None:
             self.subtitles.set_state("interrupted")

@@ -11,6 +11,20 @@ import wave
 LEVEL_INTERVAL_MS = 20
 
 
+def _level(samples, scale):
+    rms = sqrt(sum(value * value for value in samples) / len(samples)) / scale
+    return min(1.0, max(0.0, (rms - 0.015) * 5.0))
+
+
+def pcm_level(data):
+    if not data:
+        return 0.0
+    samples = array("h", data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return _level(samples, 32768)
+
+
 def wav_levels(content):
     """Read a short RMS envelope from the same PCM WAV sent to the player."""
     try:
@@ -33,8 +47,7 @@ def wav_levels(content):
                         samples.byteswap()
                 if not samples:
                     break
-                rms = sqrt(sum(value * value for value in samples) / len(samples)) / scale
-                levels.append(min(1.0, max(0.0, (rms - 0.015) * 5.0)))
+                levels.append(_level(samples, scale))
             return tuple(levels)
     except (wave.Error, EOFError, ValueError):
         return ()
