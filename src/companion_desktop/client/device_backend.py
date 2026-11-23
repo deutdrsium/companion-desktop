@@ -159,13 +159,16 @@ class DeviceBackend(LegacyBackend):
             client_id = event["client_msg_id"]
             accepted = self.turn_ids.pop(client_id, None) is not None
             self.cancel_pending.discard(client_id)
-            reason = "interrupted" if accepted else "rejected"
+            reason = event["reason"]
+            if reason != "busy":
+                reason = "interrupted" if accepted else "rejected"
             self.chat_failed.emit(client_id, reason, "")
         elif kind == "turn.cancelled" and event["status"] == "cancelled":
             for client_id, turn_id in tuple(self.turn_ids.items()):
                 if turn_id == event["turn_id"]:
                     self.turn_ids.pop(client_id, None)
                     self.cues.pop(turn_id, None)
+                    self.chat_failed.emit(client_id, "cancelled", "")
 
     def _complete(self, event):
         self.chat_done.emit(event["client_msg_id"], event["text"])

@@ -13,7 +13,7 @@ from companion_desktop.client.controller import Controller
 from companion_desktop.client.device_backend import DeviceBackend
 from companion_desktop.client.timeline import CueTrack, wav_levels
 from companion_desktop.contracts.lines import parse_reply, utterance_segments
-from companion_desktop.contracts.wire import message
+from companion_desktop.contracts.wire import ProtocolError, message
 from companion_desktop.ui.paint import Character
 from fakes import FakePlayer, FakeSubtitles
 from test_desktop_animation import Rig
@@ -212,8 +212,8 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
         controller.panel.deleteLater()
 
 
-@pytest.mark.parametrize("lose_ack", [True, False])
-def test_device_turn_delivers_once_after_reconnect(qapp, prefs, tmp_path, lose_ack):
+@pytest.fixture
+def device_controller(qapp, prefs, tmp_path):
     cfg = {"server": {"api_path": "/desktop"}, "account": {"username": "demo", "session_id": "demo"},
            "avatar": {"mapping": ""}}
     backend = DeviceBackend("http://127.0.0.1:1", "synthetic-key", cfg, tmp_path)
@@ -221,11 +221,23 @@ def test_device_turn_delivers_once_after_reconnect(qapp, prefs, tmp_path, lose_a
     backend._request = lambda *args, **kwargs: None
     prefs.set("voice_enabled", False)
     controller = Controller(Character("Demo"), "Demo", prefs, backend, device=True)
+    yield controller
+    controller.quitting = True
+    backend.close(1)
+    controller.panel.close()
+    controller.panel.deleteLater()
 
-    async def wait_for(condition):
-        async with asyncio.timeout(2):
-            while not condition():
-                await asyncio.sleep(0.01)
+
+async def wait_for(condition):
+    async with asyncio.timeout(2):
+        while not condition():
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("lose_ack", [True, False])
+def test_device_turn_delivers_once_after_reconnect(device_controller, lose_ack):
+    controller = device_controller
+    backend = controller.backend
 
     async def exercise():
         clock = [0]
@@ -273,10 +285,95 @@ def test_device_turn_delivers_once_after_reconnect(qapp, prefs, tmp_path, lose_a
             if not chat.result.done():
                 chat.result.set_result(TurnResult("failed"))
 
-    try:
-        backend.loop.run_until_complete(exercise())
-    finally:
-        controller.quitting = True
-        backend.close(1)
-        controller.panel.close()
-        controller.panel.deleteLater()
+    backend.loop.run_until_complete(exercise())
+
+
+@pytest.mark.parametrize("retry_offline", [True, False])
+def test_device_manual_retry_reuses_original_message_id(device_controller, retry_offline):
+    controller = device_controller
+    backend = controller.backend
+    session = backend.session
+
+    async def exercise():
+        host = SessionHost()
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+        chat = FakeChat()
+        sends = []
+
+        async def transport(operation, payload):
+            response = host.handle(binding, operation, payload, turns=chat)
+            for frame in payload.get("messages", ()):
+                if frame["type"] == "turn.send":
+                    sends.append(frame["body"]["client_msg_id"])
+                    if len(sends) == 1:
+                        # The host accepted the send, but the client has to reconnect manually.
+                        raise ProtocolError("unauthorized")
+            return response
+
+        session._transport = transport
+        session._poll_interval = 0.01
+        session.start()
+        await wait_for(lambda: controller.state.can_send)
+        controller.send("Example message")
+        client_id = controller.active_turn
+        await wait_for(lambda: session.connection["state"] == "closed" and bool(chat.calls))
+        bubble = users(controller)[0]
+        assert bubble.receipt == "failed"
+        chat.result.set_result(TurnResult("completed", "Saved reply."))
+        if retry_offline:
+            bubble.retry_button.click()
+            assert bubble.receipt == "queued"
+        backend.reconnect_session()
+        await wait_for(lambda: controller.state.can_send)
+        if not retry_offline:
+            bubble.retry_button.click()
+        await wait_for(lambda: len(sends) == 2)
+        assert sends == [client_id, client_id]
+        await wait_for(lambda: bool(replies(controller)))
+        assert len(chat.calls) == 1
+        assert bubble.receipt == "resent"
+        assert [bubble.text for bubble in replies(controller)] == ["Saved reply."]
+
+    backend.loop.run_until_complete(exercise())
+
+
+@pytest.mark.parametrize("status", ["cancelled", "completed", "failed"])
+def test_device_waits_for_stopped_turn_before_sending_next(device_controller, status):
+    controller = device_controller
+    backend = controller.backend
+    session = backend.session
+
+    async def exercise():
+        host = SessionHost()
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+        first = FakeChat(stop=False)
+        next_chat = FakeChat()
+        next_chat.result.set_result(TurnResult("completed", "Next reply."))
+
+        async def transport(operation, payload):
+            return host.handle(binding, operation, payload, turns=first if not first.result.done() else next_chat)
+
+        session._transport = transport
+        session._poll_interval = 0.01
+        session.start()
+        try:
+            await wait_for(lambda: controller.state.can_send)
+            controller.send("First message")
+            await wait_for(lambda: bool(first.calls))
+            controller.stop()
+            await wait_for(lambda: bool(first.cancelled))
+            controller.send("Next message")
+            first_bubble, next_bubble = users(controller)
+            assert next_bubble.receipt == "queued"
+            assert not next_chat.calls
+            first.result.set_result(TurnResult(status, "Late reply."))
+            await wait_for(lambda: bool(replies(controller)))
+            if status == "cancelled":
+                assert first_bubble.meta_label.text() == "已取消"
+            assert next_bubble.receipt == "delivered"
+            assert [bubble.text for bubble in replies(controller)] == ["Next reply."]
+        finally:
+            if not first.result.done():
+                first.result.set_result(TurnResult("failed"))
+
+    backend.loop.run_until_complete(exercise())

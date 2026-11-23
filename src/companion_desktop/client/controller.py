@@ -270,17 +270,20 @@ class Controller(QObject):
         if self.state.presence == "speaking" or (self.device and (self.utterance_id is not None
                                                                    or self.reading_gen is not None)):
             self.stop()
-        if self.state.presence == "thinking" and self.active_turn is not None:
-            bubble = self.panel.chat.add_user(text, "queued")
+        if self.active_turn is not None and (self.device or self.state.presence == "thinking"):
+            bubble = self.panel.chat.add_user(text, None)
             bubble.set_receipt("queued")
-            bubble.meta_label.setText("等她回答后再发")
+            bubble.meta_label.setText("等上一条处理完再发" if self.device else "等她回答后再发")
             self.outbox.append(bubble)
             return
         bubble = self.panel.chat.add_user(text, None)
         self._dispatch(bubble)
 
     def _dispatch(self, bubble, resent=False):
-        turn_id = uuid4().hex
+        if self.device and resent:
+            turn_id = bubble.turn_id
+        else:
+            turn_id = uuid4().hex
         bubble.turn_id = turn_id
         bubble.at = time.time()
         bubble.set_receipt("sending")
@@ -313,11 +316,11 @@ class Controller(QObject):
             self.resend.remove(bubble)
         if not self.state.can_send:
             bubble.set_receipt("queued")
-            self.resend.append(bubble)
+            (self.outbox if self.device else self.resend).append(bubble)
             return
-        if self.state.presence in ("thinking", "speaking"):
+        if self.state.presence in ("thinking", "speaking") or (self.device and self.active_turn is not None):
             bubble.set_receipt("queued")
-            bubble.meta_label.setText("等她回答后再发")
+            bubble.meta_label.setText("等上一条处理完再发" if self.device else "等她回答后再发")
             self.outbox.append(bubble)
             return
         self._dispatch(bubble, resent=True)
@@ -332,6 +335,9 @@ class Controller(QObject):
         if turn is None or turn_id != self.active_turn:
             return
         self.active_turn = None
+        if turn.get("cancel_requested"):
+            self._flush_outbox()
+            return
         if self.device:
             server_id, frames = self.backend.take_cues(turn_id)
             clean, _ = parse_reply(text)
@@ -377,13 +383,18 @@ class Controller(QObject):
                 self.avatar.end_conversation()
             self.state.turn_failed(turn_id)
         bubble = turn["bubble"]
-        if reason == "offline":
+        if turn.get("cancel_requested"):
+            if reason == "cancelled":
+                bubble.meta_label.setText("已取消")
+        elif reason == "offline":
             # never reached the server: resend once when the link is back
             bubble.set_receipt("failed")
             if bubble not in self.resend:
                 self.resend.append(bubble)
-        elif reason == "rejected":
+        elif reason in ("rejected", "busy"):
             bubble.set_receipt("failed")
+            if reason == "busy":
+                bubble.meta_label.setText("上一条还在处理")
             self.panel.composer.restore_draft(bubble.text)   # keep typed text on failure
         else:  # the reply broke off midway
             bubble.set_receipt("delivered")
@@ -397,7 +408,7 @@ class Controller(QObject):
         if (self.outbox and self.state.can_send and self.active_turn is None
                 and self.state.presence not in ("thinking", "speaking")):
             bubble = self.outbox.pop(0)
-            self._dispatch(bubble)
+            self._dispatch(bubble, resent=self.device and bubble.turn_id is not None)
 
     # ------------------------------------------------------------ speech
     def _read(self, bubble, start):
@@ -526,9 +537,15 @@ class Controller(QObject):
     def stop(self):
         """Esc / stop key / tray: cancel thinking or stop speaking."""
         if (self.state.presence == "thinking" or self.device) and self.active_turn is not None:
-            turn = self.turns.pop(self.active_turn, None)
-            outcome = self.backend.cancel(self.active_turn)
-            self.active_turn = None
+            turn_id = self.active_turn
+            if self.device:
+                # The host can still be running this turn after a stop request.
+                turn = self.turns[turn_id]
+                turn["cancel_requested"] = True
+            else:
+                turn = self.turns.pop(turn_id, None)
+                self.active_turn = None
+            outcome = self.backend.cancel(turn_id)
             self.panel.chat.hide_thinking()
             if turn is not None:
                 turn["bubble"].meta_label.setText("已取消" if outcome == "cancelled" else "已取消 · 可能仍会回复")
@@ -624,7 +641,9 @@ class Controller(QObject):
         self.state.apply_event(event)
         if self.active_turn is not None:
             # The session reconciles pending sends and accepted turns after reconnect.
-            if event["state"] == "connected" and self.state.presence != "thinking":
+            turn = self.turns[self.active_turn]
+            if (event["state"] == "connected" and self.state.presence != "thinking"
+                    and not turn.get("cancel_requested")):
                 self.state.turn_sent(self.active_turn)
         elif event["state"] != "connected" and not self.quitting:
             self.stop()
