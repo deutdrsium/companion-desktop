@@ -8,10 +8,11 @@ from PyQt5.QtCore import QObject, QUrl, pyqtSignal
 
 
 class Clip:
-    __slots__ = ("audio_id", "index", "text", "path", "mouth")
+    __slots__ = ("audio_id", "index", "text", "path", "mouth", "levels", "duration_ms")
 
-    def __init__(self, audio_id, index, text, path, mouth):
+    def __init__(self, audio_id, index, text, path, mouth, levels=()):
         self.audio_id, self.index, self.text, self.path, self.mouth = audio_id, index, text, path, mouth
+        self.levels, self.duration_ms = levels, 0
 
 
 class Player(QObject):
@@ -20,13 +21,15 @@ class Player(QObject):
     finished = pyqtSignal(object)         # Clip
     failed = pyqtSignal(object)           # Clip
     drained = pyqtSignal()                # queue empty after the last clip
+    paused = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, local_levels=False):
         super().__init__(parent)
         from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
         self._content, self._qmp = QMediaContent, QMediaPlayer
         self.player = QMediaPlayer(self)
-        self.player.setNotifyInterval(100)
+        self.local_levels = local_levels
+        self.player.setNotifyInterval(30 if local_levels else 100)
         self.player.stateChanged.connect(self._state)
         self.player.positionChanged.connect(self._position)
         self.player.mediaStatusChanged.connect(self._status)
@@ -46,7 +49,11 @@ class Player(QObject):
         with tempfile.NamedTemporaryFile(prefix="companion-speech-", suffix=".wav", delete=False) as f:
             f.write(wav)
             path = f.name
-        self.queue.append(Clip(audio_id, index, text, path, mouth))
+        levels = ()
+        if self.local_levels:
+            from .timeline import wav_levels
+            levels = wav_levels(wav)
+        self.queue.append(Clip(audio_id, index, text, path, mouth, levels))
         self._next()
 
     def _next(self):
@@ -56,17 +63,23 @@ class Player(QObject):
             return
         self.current = self.queue.popleft()
         self.began = False
-        self.player.setMedia(self._content(QUrl.fromLocalFile(self.current.path)))
-        self.player.play()
+        clip = self.current
+        self.player.setMedia(self._content(QUrl.fromLocalFile(clip.path)))
+        if self.current is clip:
+            self.player.play()
 
     def _state(self, state):
         if state == self._qmp.PlayingState and self.current is not None and not self.began:
             self.began = True
+            self.current.duration_ms = self.player.duration()
             self.started.emit(self.current)
+        elif state == self._qmp.PausedState:
+            self.paused.emit()
 
     def _position(self, position):
-        if self.current is not None and self.began:
-            d = self.player.duration()
+        if (self.current is not None and self.began
+                and (not self.local_levels or self.player.state() == self._qmp.PlayingState)):
+            d = self.current.duration_ms = self.player.duration()
             self.progress.emit(self.current, position, (position / d) if d > 0 else 0.0)
 
     def _release(self):
@@ -105,5 +118,6 @@ class Player(QObject):
             except OSError:
                 pass
         self.queue.clear()
+        clip = self._release()
         self.player.stop()
-        return self._release()
+        return clip

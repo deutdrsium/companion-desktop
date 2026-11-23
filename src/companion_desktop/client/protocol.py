@@ -4,6 +4,8 @@ import json
 import re
 import sys
 
+from ..contracts.lines import sentence_spans
+
 # Inline control tags the host may leave in a reply; never shown or spoken.
 _TAGS = r"soullink|wardrobe|expression|pc_tts|tts|voice|record|send_message_to_user|语音"
 
@@ -13,31 +15,6 @@ def visible_text(text):
     value = re.sub(rf"(?is)<(?:{_TAGS})\b[^>]*>.*$", "", value)
     value = re.sub(r"(?is)<l2d(?::[^>]*)?>", "", value)
     return re.sub(rf"(?is)</?(?:{_TAGS})\b[^>]*>", "", value).strip()
-
-
-def sentence_spans(clean):
-    """Split already-cleaned text into (start, end) code-point spans that cover it in order.
-
-    Concatenating the spans gives back ``clean``; whitespace-only spans are merged into
-    the previous sentence so highlighting never lands on an empty piece.
-    """
-    spans = []
-    for m in re.finditer(r".*?(?:[。！？!?；;…]+[”」』）)]*|\n+|$)", clean, re.S):
-        s, e = m.span()
-        if s == e:
-            continue
-        while e - s > 1000:
-            piece = clean[s:s + 1000]
-            cut = max(piece.rfind("，"), piece.rfind(","), piece.rfind(" "))
-            cut = cut + 1 if cut > 0 else 1000
-            spans.append((s, s + cut))
-            s += cut
-        if not clean[s:e].strip():
-            if spans:
-                spans[-1] = (spans[-1][0], e)
-            continue
-        spans.append((s, e))
-    return spans
 
 
 def sentences(text):

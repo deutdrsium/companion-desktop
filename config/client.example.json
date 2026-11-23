@@ -12,7 +12,8 @@
     "ssh_options": [],
     "remote_port": 6185,
     "api_path": "/api/v1/plugins/extensions/<companion-plugin>/desktop",
-    "chat_path": "/api/v1/chat"
+    "chat_path": "/api/v1/chat",
+    "device_session": false
   },
   "account": {
     "username": "desktop-user",
@@ -20,8 +21,16 @@
     "keyring_service": "CompanionDesktop"
   },
   "subtitle": {
+    "enabled": true,
     "port": 18676,
     "token_file": ""
+  },
+  "headset_barge_in": false,
+  "avatar": {
+    "mapping": "",
+    "port": 8001,
+    "inputs": ["head_pitch", "head_roll", "mouth_open", "mouth_form", "eye_smile",
+               "eye_left", "eye_right", "look_x", "look_y", "brow_left", "brow_right"]
   },
   "instance_mutex": "Local\\CompanionDesktop",
   "data_dir": "",

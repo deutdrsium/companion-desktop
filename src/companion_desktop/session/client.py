@@ -212,6 +212,9 @@ class DesktopSession(_SessionEvents):
     def device_capabilities(self):
         return deepcopy(self._local_caps)
 
+    def capabilities_published(self, revision):
+        return self.session is not None and self._published_revision == revision
+
     def start(self):
         if self._runner is None or self._runner.done():
             self._closing = False

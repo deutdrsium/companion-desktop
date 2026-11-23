@@ -12,11 +12,13 @@ from PyQt5.QtCore import QObject, QTimer, QUrl
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QApplication
 
+from ..contracts.lines import parse_reply, sentence_spans
 from ..ui.observe import ConsentDialog
 from ..ui.panel import Panel
 from ..ui.session_state import SessionState
 from ..ui.settings import SettingsWindow
 from .protocol import desktop_locked, sentences, visible_text, vts_running
+from .timeline import CueTrack, LEVEL_INTERVAL_MS
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +29,8 @@ GUARD_INTERVAL_MS = 3000
 
 class Controller(QObject):
     def __init__(self, character, title, prefs, backend, link=None, player=None, subtitles=None,
-                 rhythm_service=None, voice_service=None, log_dir=None, tray=None, version="0.2"):
+                 rhythm_service=None, voice_service=None, log_dir=None, tray=None, version="0.2", *, device=False,
+                 barge_in=None):
         super().__init__()
         self.character, self.title, self.prefs = character, title, prefs
         self.backend, self.link, self.player, self.subtitles = backend, link, player, subtitles
@@ -48,6 +51,19 @@ class Controller(QObject):
         # speech
         self.reading = None        # ReplyBubble being read
         self.reading_gen = None
+        self.device = device
+        self.avatar = backend.avatar if device else None
+        self.barge_in = barge_in
+        if barge_in is not None:
+            barge_in.speech_started.connect(self.stop)
+        self.utterance_id = None
+        self.cue_track = None
+        self.model_generation = None
+        self.gestures = {}
+        self.text_lines = None
+        self.text_timer = QTimer(self)
+        self.text_timer.setInterval(30)
+        self.text_timer.timeout.connect(self._text_tick)
         # observation
         self.obs_gen = 0
         self.periodic = False
@@ -87,6 +103,10 @@ class Controller(QObject):
         b.audio.connect(self._audio)
         b.speech_error.connect(self._speech_error)
         b.screen_result.connect(self._screen_result)
+        if self.device:
+            b.connection.connect(self._device_connection)
+            b.utterance_cancelled.connect(self._utterance_cancelled)
+            b.voice_revoked.connect(self._voice_revoked)
         if self.link is not None:
             b.unreachable.connect(self.link.lost)
             self.link.changed.connect(self._link_changed)
@@ -97,6 +117,8 @@ class Controller(QObject):
             self.player.progress.connect(self._clip_progress)
             self.player.finished.connect(self._clip_finished)
             self.player.failed.connect(self._clip_failed)
+            if self.avatar is not None:
+                self.player.paused.connect(self.avatar.stop_mouth)
         if self.subtitles is not None:
             self._subtitle_style()
             self.state.progressed.connect(lambda f: self.subtitles.set_state("speaking", None, f)
@@ -122,7 +144,8 @@ class Controller(QObject):
 
     def start(self):
         """Connected: open the screen session and load history."""
-        self.state.set_connection("connected")
+        if not self.device:
+            self.state.set_connection("connected")
         self.backend.screen(self.obs_gen, "open")
         self.backend.load_history()
 
@@ -204,7 +227,10 @@ class Controller(QObject):
         elif key.startswith("subtitle_"):
             self._subtitle_style()
         elif key == "voice_enabled" and not value:
-            self.stop_speech(collapse=True)
+            if self.device and self.reading is not None:
+                self.stop()
+            elif not self.device:
+                self.stop_speech(collapse=True)
 
     def _subtitle_style(self):
         if self.subtitles is not None:
@@ -221,12 +247,15 @@ class Controller(QObject):
 
     def _typing(self, active):
         self.state.set_typing(active)
-        if active and self.state.presence == "speaking":
-            self.stop()  # typing while she speaks stops her first
+        if active and (self.state.presence == "speaking" or (self.device and self.active_turn is None
+                                                            and self.utterance_id is not None)):
+            self.stop()
+        if self.avatar is not None:
+            self.avatar.set_typing(active)
 
     # ------------------------------------------------------------ history
     def _history(self, messages):
-        self.panel.chat.load_history(messages, strip=visible_text)
+        self.panel.chat.load_history(messages, strip=(lambda text: parse_reply(text)[0]) if self.device else visible_text)
         self.ready = True
 
     def _history_failed(self):
@@ -238,7 +267,8 @@ class Controller(QObject):
         if not self.state.can_send:
             self.panel.composer.restore_draft(text)
             return
-        if self.state.presence == "speaking":
+        if self.state.presence == "speaking" or (self.device and (self.utterance_id is not None
+                                                                   or self.reading_gen is not None)):
             self.stop()
         if self.state.presence == "thinking" and self.active_turn is not None:
             bubble = self.panel.chat.add_user(text, "queued")
@@ -266,6 +296,15 @@ class Controller(QObject):
             self.reading = None
         self.panel.chat.show_thinking()
         self.panel.chat.scroll_to_bottom()
+        if self.device:
+            if self.reading is not None:
+                self.stop_speech()
+                self.reading.set_mode("stopped")
+                self.reading = None
+            else:
+                self._release_presentation()
+        if self.avatar is not None:
+            self.avatar.message_sent(turn_id)
         self.state.turn_sent(turn_id)
         self.backend.chat(bubble.text, turn_id)
 
@@ -293,22 +332,37 @@ class Controller(QObject):
         if turn is None or turn_id != self.active_turn:
             return
         self.active_turn = None
-        clean = visible_text(text)
+        if self.device:
+            server_id, frames = self.backend.take_cues(turn_id)
+            clean, _ = parse_reply(text)
+            server_id = server_id or turn_id
+            segs = [clean[start:end] for start, end in sentence_spans(clean)]
+        else:
+            clean = visible_text(text)
+            segs = sentences(clean)
         if not clean:
+            if self.avatar is not None:
+                self.avatar.end_conversation()
             self.panel.chat.hide_thinking()
             self.state.reply_arrived(turn_id, False)
             self._flush_outbox()
             return
-        segs = sentences(clean) or [clean]
-        bubble = self.panel.chat.add_reply(clean, segs)
+        bubble = self.panel.chat.add_reply(clean, segs or [clean])
         bubble.stop.connect(self.stop)
         bubble.resume.connect(self._resume)
         bubble.replay.connect(lambda b: self._resume(b, 0))
-        speak = self.player is not None and self.prefs.get("voice_enabled")
+        speak = (self.player is not None and self.prefs.get("voice_enabled")
+                 and (not self.device or self.backend.can_speak))
+        if self.device:
+            self.utterance_id = frames[0]["utterance_id"] if frames else server_id
+            self.cue_track = CueTrack(frames)
+            self.model_generation = self.avatar.output.generation if self.avatar is not None else None
         if speak:
             self._read(bubble, 0)
         else:
             bubble.set_mode("plain")
+            if self.device:
+                self._start_text(bubble.segments)
         self.state.reply_arrived(turn_id, speak)
         self._flush_outbox()
 
@@ -319,6 +373,8 @@ class Controller(QObject):
         if turn_id == self.active_turn:
             self.active_turn = None
             self.panel.chat.hide_thinking()
+            if self.avatar is not None:
+                self.avatar.end_conversation()
             self.state.turn_failed(turn_id)
         bubble = turn["bubble"]
         if reason == "offline":
@@ -355,6 +411,10 @@ class Controller(QObject):
             return
         if self.state.presence in ("thinking", "speaking"):
             return
+        if self.device:
+            if not self.prefs.get("voice_enabled") or not self.backend.can_speak:
+                return
+            self.stop_speech()
         self._read(bubble, start)
         bubble.set_mode("plain")
 
@@ -364,6 +424,12 @@ class Controller(QObject):
         self.player.enqueue(audio_id, index, sentence, wav, mouth)
 
     def _clip_started(self, clip):
+        if self.avatar is not None:
+            self.avatar.end_conversation()
+        if self.device and clip.duration_ms > 0:
+            self._advance_cues(clip.index, clip.text, clip.audio_id, self.player.player.position(), clip.duration_ms)
+        if self.barge_in is not None:
+            self.barge_in.start()
         bubble = self.reading
         total = len(bubble.segments) if bubble is not None else 1
         if bubble is not None:
@@ -371,16 +437,29 @@ class Controller(QObject):
         self.state.segment_started(clip.index, total, clip.text)
         if self.subtitles is not None:
             self.subtitles.set_state("speaking", clip.text, 0.0)
-        if clip.mouth:
+        if not self.device and clip.mouth:
             self.backend.sync("start", clip.audio_id, self.player.player.position())
 
     def _clip_progress(self, clip, position, fraction):
         self.state.segment_progress(fraction)
-        if clip.mouth:
+        if self.device:
+            if self.avatar is not None:
+                index = position // LEVEL_INTERVAL_MS
+                self.avatar.mouth_level(clip.levels[index] if 0 <= index < len(clip.levels) else 0)
+            if clip.duration_ms > 0:
+                self._advance_cues(clip.index, clip.text, clip.audio_id, position, clip.duration_ms)
+        elif clip.mouth:
             self.backend.sync("position", clip.audio_id, position)
 
     def _clip_finished(self, clip):
-        if clip.mouth:
+        if self.barge_in is not None:
+            self.barge_in.stop()
+        if self.device:
+            if self.avatar is not None:
+                self.avatar.stop_mouth()
+            if clip.duration_ms > 0:
+                self._advance_cues(clip.index, clip.text, clip.audio_id, clip.duration_ms, clip.duration_ms)
+        elif clip.mouth:
             self.backend.sync("stop", clip.audio_id)
         bubble = self.reading
         if bubble is not None:
@@ -389,18 +468,24 @@ class Controller(QObject):
                 bubble.current = -1
                 bubble.set_mode("plain")
                 self.reading = None
+                self.reading_gen = None
                 self._speech_done()
 
     def _clip_failed(self, clip):
-        if clip.mouth:
-            self.backend.sync("stop", clip.audio_id)
-        self.backend.stop_speech()
-        self.player.stop()
+        if self.device:
+            self.stop_speech()
+        else:
+            if clip.mouth:
+                self.backend.sync("stop", clip.audio_id)
+            self.backend.stop_speech()
+            self.player.stop()
         self._speech_failed(clip.index)
 
     def _speech_error(self, generation, index):
         if generation != self.reading_gen:
             return
+        if self.device:
+            self.stop_speech()
         self._speech_failed(index)
 
     def _speech_failed(self, index):
@@ -409,11 +494,16 @@ class Controller(QObject):
             if index <= 0 or bubble.spoken_until < 0:
                 bubble.set_mode("speech_failed")
             else:
-                bubble.spoken_until = index - 1
+                if not self.device:
+                    bubble.spoken_until = index - 1
                 bubble.set_mode("interrupted")
+        if self.device:
+            self.reading = None
         self._speech_done()
 
     def _speech_done(self):
+        if self.device:
+            self._finish_presentation()
         self.state.speech_finished()
         if self.subtitles is not None:
             self.subtitles.set_state("idle")
@@ -421,8 +511,13 @@ class Controller(QObject):
     def stop_speech(self, collapse=False):
         """Stop audio now, drop queued synthesis, clear the subtitle."""
         self.backend.stop_speech()
+        if self.barge_in is not None:
+            self.barge_in.stop()
         clip = self.player.stop() if self.player is not None else None
-        if clip is not None and clip.mouth:
+        if self.device:
+            self.reading_gen = None
+            self._release_presentation()
+        elif clip is not None and clip.mouth:
             self.backend.sync("stop", clip.audio_id)
         if self.subtitles is not None:
             self.subtitles.set_state("interrupted")
@@ -430,7 +525,7 @@ class Controller(QObject):
 
     def stop(self):
         """Esc / stop key / tray: cancel thinking or stop speaking."""
-        if self.state.presence == "thinking" and self.active_turn is not None:
+        if (self.state.presence == "thinking" or self.device) and self.active_turn is not None:
             turn = self.turns.pop(self.active_turn, None)
             outcome = self.backend.cancel(self.active_turn)
             self.active_turn = None
@@ -441,7 +536,8 @@ class Controller(QObject):
             self.state.interrupted()
             self._flush_outbox()
             return
-        if self.state.presence in ("speaking", "thinking") or (self.player is not None and self.player.active):
+        if (self.state.presence in ("speaking", "thinking") or (self.player is not None and self.player.active)
+                or (self.device and (self.utterance_id is not None or self.reading_gen is not None))):
             playing = self.reading.current if self.reading is not None else -1
             self.stop_speech()
             if self.reading is not None:
@@ -449,9 +545,90 @@ class Controller(QObject):
                 self.reading.set_mode("interrupted")
             self.state.interrupted()
 
+    def _advance_cues(self, index, text, audio_id, position, duration):
+        if (self.avatar is None or self.cue_track is None
+                or self.avatar.output.generation != self.model_generation):
+            return
+        for cue, source, delay in self.cue_track.advance(index, text, audio_id, position, duration, time.monotonic()):
+            log.debug("Speech cue %s %s position delay %.1f ms", cue["action"], source, delay)
+            self.avatar.play_cue(cue, lambda result, cue=cue: self._cue_result(cue, result))
+
+    def _cue_result(self, cue, result):
+        task_id = cue["task_id"]
+        if result.status == "accepted":
+            self.gestures[task_id] = cue
+        elif result.status != "running":
+            self.gestures.pop(task_id, None)
+            log.debug("Speech cue %s finished with %s", cue["action"], result.status)
+            if self.cue_track is None and not self.gestures:
+                self.utterance_id = None
+
+    def _finish_presentation(self):
+        self.cue_track = None
+        if not self.gestures:
+            self.utterance_id = None
+
+    def _start_text(self, segments):
+        if self.avatar is not None:
+            self.avatar.end_conversation()
+        self.text_lines = iter(enumerate(segments))
+        self._next_text()
+        self.text_timer.start()
+
+    def _next_text(self):
+        line = next(self.text_lines, None)
+        if line is None:
+            self.text_timer.stop()
+            self.text_lines = None
+            self._finish_presentation()
+            if self.subtitles is not None:
+                self.subtitles.set_state("idle")
+            return
+        self.text_index, self.text_line = line
+        self.text_start = time.monotonic()
+        self.text_duration = max(900, min(6000, 65 * len(self.text_line)))
+        if self.subtitles is not None:
+            self.subtitles.set_state("speaking", self.text_line, 0)
+        self._advance_cues(self.text_index, self.text_line, None, 0, self.text_duration)
+
+    def _text_tick(self):
+        if self.text_lines is None:
+            return
+        position = min(self.text_duration, (time.monotonic() - self.text_start) * 1000)
+        self._advance_cues(self.text_index, self.text_line, None, position, self.text_duration)
+        if self.subtitles is not None:
+            self.subtitles.set_state("speaking", None, position / self.text_duration)
+        if position >= self.text_duration:
+            self._next_text()
+
+    def _release_presentation(self):
+        self.text_timer.stop()
+        if self.text_lines is not None and self.subtitles is not None:
+            self.subtitles.set_state("interrupted")
+        self.text_lines = self.cue_track = self.utterance_id = None
+        if self.avatar is not None:
+            self.avatar.end_conversation()
+            for cue in self.gestures.values():
+                self.avatar.cancel(cue, "cancelled")
+        self.gestures.clear()
+
+    def _utterance_cancelled(self, utterance_id):
+        if utterance_id == self.utterance_id:
+            self.stop()
+
+    def _voice_revoked(self):
+        if self.reading_gen is not None:
+            self.stop()
+
+    def _device_connection(self, event):
+        self.state.apply_event(event)
+        if event["state"] != "connected" and not self.quitting:
+            self.stop()
+
     # ------------------------------------------------------------ link
     def _link_changed(self, state, attempt, next_ms):
-        self.state.set_connection(state, attempt, next_ms)
+        if not self.device:
+            self.state.set_connection(state, attempt, next_ms)
         if state == "offline":
             if self.state.presence != "idle" or self.reading is not None:
                 self.stop_speech()
@@ -475,6 +652,8 @@ class Controller(QObject):
                 self.outbox.append(bubble)
 
     def reconnect_now(self):
+        if self.device:
+            self.backend.reconnect_session()
         if self.link is not None:
             self.link.connect_now()
 
