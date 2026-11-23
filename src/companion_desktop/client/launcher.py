@@ -176,6 +176,8 @@ class Launch(QObject):
             from .device_backend import DeviceBackend
             backend = DeviceBackend(base, self._key, cfg, folder, tts=player is not None,
                                     subtitle=self.subtitles is not None)
+            if player is not None and player.supports_pcm():
+                backend.enable_pcm()
             if player is not None and cfg.get("headset_barge_in") is True:
                 from .barge_in import BargeIn
                 barge_in = BargeIn()

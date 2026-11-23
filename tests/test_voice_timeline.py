@@ -6,7 +6,9 @@ import time
 import wave
 
 from PyQt5.QtCore import QObject, pyqtSignal
+import pytest
 
+from companion_desktop.client.audio import PCM_RATE, PcmClip
 from companion_desktop.client.controller import Controller
 from companion_desktop.client.device_backend import DeviceBackend
 from companion_desktop.client.timeline import CueTrack, wav_levels
@@ -60,6 +62,9 @@ def test_b04_codepoint_alignment_timestamps_and_estimates():
 class Player(FakePlayer):
     paused = pyqtSignal()
 
+    def enqueue_pcm(self, clip):
+        self.queue.append(clip)
+
     def play_next(self):
         self.queue[0].duration_ms = 1100
         return super().play_next()
@@ -79,7 +84,8 @@ class Microphone(QObject):
         self.active = False
 
 
-def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
+@pytest.mark.parametrize("streaming", [False, True])
+def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path, streaming):
     rig = Rig()
     cfg = {"server": {"api_path": "/desktop"}, "account": {"username": "demo", "session_id": "demo"},
            "avatar": {"mapping": ""}}
@@ -138,9 +144,14 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
         assert first == "你看🐟这条鱼[示例]！" and second == "下一句。"
         assert replies(controller)[-1].text == first + second and rig.avatar.motion.thinking
         generation = backend.generation
-        backend.audio.emit(generation, "audio-demo", 0, first, sentence_audio(), True)
+        if streaming:
+            stream = PcmClip("audio-demo", 0, first)
+            stream.pcm.extend(b"\0\0" * (PCM_RATE // 50) + b"\x00\x20" * PCM_RATE)
+            backend.pcm.emit(generation, stream)
+        else:
+            backend.audio.emit(generation, "audio-demo", 0, first, sentence_audio(), True)
+            player.queue[0].levels = wav_levels(sentence_audio())
         backend.audio.emit(generation, "audio-next-demo", 1, second, sentence_audio(), True)
-        player.queue[0].levels = wav_levels(sentence_audio())
         clip = player.play_next()
         assert mic.active and not rig.avatar.motion.thinking
         assert captions.states[-1] == ("speaking", first)
@@ -160,6 +171,8 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
         assert backend.loop.run_until_complete(rig.step())["mouth_open"] == 0
         assert captions.states[-1][0] == "interrupted"
         backend.audio.emit(generation, "stale-audio-demo", 1, second, b"", True)
+        if streaming:
+            backend.pcm.emit(generation, PcmClip("stale-pcm-demo", 1, second))
         assert not player.active
 
         prefs.set("voice_enabled", False)
@@ -181,6 +194,14 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path):
         controller.send("read both")
         settle_turn()
         generation = backend.generation
+        if streaming:
+            backend.enable_pcm()
+            backend.pcm.emit(generation, PcmClip("audio-demo", 0, first))
+            player.failed.emit(player.play_next())  # Output device fails after the stream is selected.
+            assert backend.speech_stream is None and backend.generation != generation
+            assert not player.active and not mic.active and rig.avatar.motion.mouth_target == 0
+            assert synthesis[-1] == [first, second]
+            generation = backend.generation
         backend.audio.emit(generation, "audio-demo", 0, first, sentence_audio(), False)
         backend.audio.emit(generation, "audio-next-demo", 1, second, sentence_audio(), False)
         player.play_next()

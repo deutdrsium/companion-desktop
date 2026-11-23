@@ -51,6 +51,8 @@ class LegacyBackend(QObject):
     chat_done = pyqtSignal(str, str)              # turn_id, full text
     chat_failed = pyqtSignal(str, str, str)       # turn_id, reason (offline|rejected|interrupted), partial
     audio = pyqtSignal(int, str, int, str, bytes, bool)  # generation, audio id, index, sentence, wav, mouth
+    pcm = pyqtSignal(int, object)                 # generation, PcmClip with first audio
+    pcm_lost = pyqtSignal(int, object)            # generation, incomplete PcmClip
     speech_error = pyqtSignal(int, int)           # generation, failed index
     screen_result = pyqtSignal(int, object)
     unreachable = pyqtSignal()                    # any request failed to connect -> probe the link
@@ -64,6 +66,7 @@ class LegacyBackend(QObject):
         self.username = cfg["account"]["username"]
         self.session_id = cfg["account"]["session_id"]
         self.speech_jobs = queue.Queue()
+        self.speech_stream = None
         self.sync_jobs = deque()
         self.sync_condition = threading.Condition()
         self.generation = 0
@@ -142,15 +145,31 @@ class LegacyBackend(QObject):
         return "unknown"
 
     # ------------------------------------------------------------ speech
+    def enable_pcm(self):
+        from .speech_stream import SpeechStream
+
+        self.speech_stream = SpeechStream(self)
+
+    def disable_pcm(self):
+        self.speech_stream.stop()
+        self.speech_stream.deleteLater()
+        self.speech_stream = None
+
     def enqueue_speech(self, segments, start=0):
         generation = self.generation
-        for i, sentence in enumerate(segments):
-            if i >= start and sentence.strip():
-                self.speech_jobs.put((generation, i, sentence))
+        jobs = ((generation, i, sentence) for i, sentence in enumerate(segments)
+                if i >= start and sentence.strip())
+        if self.speech_stream is not None:
+            self.speech_stream.enqueue(jobs)
+        else:
+            for job in jobs:
+                self.speech_jobs.put(job)
         return generation
 
     def stop_speech(self):
         self.generation += 1
+        if self.speech_stream is not None:
+            self.speech_stream.stop()
 
     def _speech_loop(self):
         while not self.closed:
@@ -204,6 +223,8 @@ class LegacyBackend(QObject):
         threading.Thread(target=run, daemon=True, name="screen").start()
 
     def close(self, generation):
+        if self.speech_stream is not None:
+            self.disable_pcm()
         try:
             self._request(self.api + "/screen", payload={"action": "end", "generation": generation,
                                                           "session": self.screen_session}, timeout=(0.5, 2))
