@@ -26,11 +26,9 @@ def qapp(tmp_path_factory):
 
 
 @pytest.fixture
-def prefs(qapp):
+def prefs(qapp, tmp_path):
     from companion_desktop.ui.settings import Prefs
-    p = Prefs("CompanionDesktopTest", "Panel")
-    p.store.clear()
-    return p
+    return Prefs("CompanionDesktopTest", tmp_path.name)
 
 
 @pytest.fixture
