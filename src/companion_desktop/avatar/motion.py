@@ -27,6 +27,12 @@ LAUGH = {"eye_left": 0.72, "eye_right": 0.72, "eye_smile": 0.85, "mouth_form": 0
 GESTURE_SECONDS = {"hold_laugh": 2.8, "nod": 0.65, "head_tilt": 1.05}
 
 
+def cursor_offset(x, y, left, top, width, height, model_x=0.0, model_y=0.0):
+    """Normalize screen pixels relative to the VTS model origin (positive Y down)."""
+    # Each window axis spans [-1, 1]; the model-position Y from VTS points up.
+    return 2 * (x - left) / width - 1 - model_x, 2 * (y - top) / height - 1 + model_y
+
+
 def unit(value):
     return max(0.0, min(1.0, value))
 

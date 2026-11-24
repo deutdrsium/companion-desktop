@@ -1,6 +1,6 @@
 """Multi-line input: grows 1-4 lines, Enter sends, Shift+Enter breaks, Esc stops."""
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtWidgets import QFrame, QHBoxLayout, QPlainTextEdit, QVBoxLayout, QWidget
 
@@ -87,7 +87,7 @@ class Composer(QWidget):
         self._idle = QTimer(self)
         self._idle.setSingleShot(True)
         self._idle.setInterval(TYPING_IDLE_MS)
-        self._idle.timeout.connect(lambda: self._set_typing(False))
+        self._idle.timeout.connect(self._typing_idle)
         self.entry.textChanged.connect(self._changed)
         self.entry.submit.connect(self._submit)
         self.entry.escape.connect(self.stop)
@@ -143,6 +143,10 @@ class Composer(QWidget):
         else:
             self._idle.stop()
             self._set_typing(False)
+
+    @pyqtSlot()
+    def _typing_idle(self):
+        self._set_typing(False)
 
     def _set_typing(self, active):
         if active != self._typing:

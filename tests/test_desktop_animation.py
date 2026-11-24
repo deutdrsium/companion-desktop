@@ -9,8 +9,7 @@ import unittest
 
 from companion_desktop.avatar.model_actions import StaleOutputError
 from companion_desktop.avatar.model_catalog import InputBinding, ModelReadback, load_mapping
-from companion_desktop.avatar.motion import FRAME_PERIOD, PAUSE_GAP
-from companion_desktop.client.device_backend import _relative_cursor
+from companion_desktop.avatar.motion import FRAME_PERIOD, PAUSE_GAP, cursor_offset
 from companion_desktop.avatar.procedural import AnimatedSession, ProceduralAvatar
 from companion_desktop.avatar.vts import CHANNELS, VTSOutput
 from companion_desktop.contracts.wire import message
@@ -172,7 +171,7 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         # The model is left and below this window's centre. Its origin, not the
         # monitor centre, is the zero for pointer deltas.
         def position(x, y):
-            return _relative_cursor(x, y, 100, 200, 800, 600, -0.5, -0.5)
+            return cursor_offset(x, y, 100, 200, 800, 600, -0.5, -0.5)
 
         self.assertEqual(position(300, 650), (0, 0))
         rig.avatar.pointer(position(300, 650))

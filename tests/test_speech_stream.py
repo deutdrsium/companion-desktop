@@ -10,7 +10,7 @@ import time
 import wave
 
 from PyQt5 import QtMultimedia
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtMultimedia import QAudio
 from PyQt5.QtTest import QTest
 import pytest
@@ -40,11 +40,13 @@ def service(synthesize):
 
         def do_POST(self):
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.close_connection = True
             synthesize(self, payload["text"])
 
         def wave(self):
             data = json.dumps(wav_payload()).encode()
             self.send_response(200)
+            self.send_header("Connection", "close")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -52,6 +54,7 @@ def service(synthesize):
 
         def pcm(self):
             self.send_response(200)
+            self.send_header("Connection", "close")
             self.send_header("Content-Type", PCM_CONTENT_TYPE)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
@@ -60,7 +63,8 @@ def service(synthesize):
             self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server.daemon_threads = False  # server_close joins the request handlers
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05})
         thread.start()
         try:
             yield f"http://127.0.0.1:{server.server_port}"
@@ -140,6 +144,29 @@ class FakePcmOutput(QObject):
         self.audio_state = QAudio.StoppedState
 
 
+class PlaybackSlots(QObject):
+    def __init__(self, backend, player):
+        super().__init__(player)
+        self.player = player
+        backend.pcm.connect(self.pcm)
+        backend.pcm_lost.connect(self.pcm_lost)
+        # The legacy WAV worker emits from a Python thread. Bind delivery to
+        # this main-thread QObject instead of an unbound Python callback.
+        backend.audio.connect(self.wav, Qt.QueuedConnection)
+
+    @pyqtSlot(int, object)
+    def pcm(self, generation, clip):
+        self.player.enqueue_pcm(clip)
+
+    @pyqtSlot(int, object)
+    def pcm_lost(self, generation, clip):
+        self.player.discard_pcm(clip)
+
+    @pyqtSlot(int, str, int, str, bytes, bool)
+    def wav(self, generation, audio_id, index, text, wav, mouth):
+        self.player.enqueue(audio_id, index, text, wav, mouth)
+
+
 @pytest.fixture
 def desk(qapp, monkeypatch):
     monkeypatch.setattr(QtMultimedia, "QMediaPlayer", FakeMedia)
@@ -153,61 +180,76 @@ def desk(qapp, monkeypatch):
         if streaming:
             backend.enable_pcm()
         player = Player(local_levels=True)
-        backend.pcm.connect(lambda generation, clip: player.enqueue_pcm(clip))
-        backend.pcm_lost.connect(lambda generation, clip: player.discard_pcm(clip))
-        backend.audio.connect(lambda generation, *args: player.enqueue(*args))
+        PlaybackSlots(backend, player)
         try:
             yield backend, player
         finally:
-            player.stop()
             backend._request = lambda *args, **kwargs: None
             backend.close(0)
+            workers = backend._speech_thread, backend._sync_thread
+            for worker in workers:
+                worker.join(timeout=5)
+            player.stop()
+            player.deleteLater()
+            assert not any(worker.is_alive() for worker in workers)
+            backend.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
     return connected
 
 
-def test_mock_time_to_first_audio_and_pcm_clock(desk):
+@pytest.mark.parametrize("streaming", [False, True])
+def test_mock_time_to_first_audio_and_pcm_clock(desk, streaming):
+    waiting_to_finish = threading.Event()
+    allow_finish = threading.Event()
+
     def synthesize(req, _):
-        time.sleep(0.15)
-        if req.headers.get("Accept") == PCM_CONTENT_TYPE:
+        if streaming:
             req.pcm()
             req.chunk(FRAME[:3])
             req.chunk(FRAME[3:])
-            time.sleep(0.55)
+        waiting_to_finish.set()
+        if not allow_finish.wait(timeout=5):
+            return
+        if streaming:
             req.chunk(FRAME + b"\0" * 4)
             req.chunk(b"")
         else:
-            time.sleep(0.55)
             req.wave()
 
-    with service(synthesize) as base:
-        times = []
-        for streaming in (False, True):
-            with desk(base, streaming=streaming) as (backend, player):
-                started, progress, pauses, finished = [], [], [], []
-                player.started.connect(lambda clip: started.append((time.perf_counter(), clip)))
-                player.progress.connect(lambda clip, ms, fraction: progress.append((ms, clip.level_at(ms))))
-                player.paused.connect(lambda: pauses.append(True))
-                player.finished.connect(finished.append)
-                request_at = time.perf_counter()
-                backend.enqueue_speech(["Demo sentence."])
+    with service(synthesize) as base, desk(base, streaming=streaming) as (backend, player):
+        started, progress, pauses, finished = [], [], [], []
+        player.started.connect(started.append)
+        player.progress.connect(lambda clip, ms, fraction: progress.append((ms, clip.level_at(ms))))
+        player.paused.connect(lambda: pauses.append(True))
+        player.finished.connect(finished.append)
+        backend.enqueue_speech(["Demo sentence."])
+        try:
+            wait_for(waiting_to_finish.is_set)
+            if not streaming:
+                # The WAV request cannot start playback until the response is released.
+                assert not started
+                allow_finish.set()
                 wait_for(lambda: started)
-                times.append(started[0][0] - request_at)
-                if streaming:
-                    clip = started[0][1]
-                    output = player._pcm_output
-                    assert not clip.complete and output.written == PCM
-                    assert progress[0][0] == 0 and progress[0][1] > 0.9
-                    output.audio_state = QAudio.IdleState
-                    wait_for(lambda: pauses)  # no mouth movement while waiting for more audio
-                    wait_for(lambda: clip.complete and output.written == PCM * 2)
-                    assert clip.duration_ms == 40
-                    wait_for(lambda: progress[-1][0] == 20)
-                    output.audio_state = QAudio.IdleState
-                    wait_for(lambda: finished)
-                    assert finished == [clip]
-    print(f"Mock first audio: WAV {times[0] * 1000:.0f} ms; PCM {times[1] * 1000:.0f} ms")
-    assert times[1] < times[0]
+                assert started[0].path
+                return
+
+            wait_for(lambda: started)
+            clip = started[0]
+            output = player._pcm_output
+            assert not clip.complete and output.written == PCM
+            assert progress[0][0] == 0 and progress[0][1] > 0.9
+            output.audio_state = QAudio.IdleState
+            wait_for(lambda: pauses)  # no mouth movement while waiting for more audio
+            allow_finish.set()
+            wait_for(lambda: clip.complete and output.written == PCM * 2)
+            assert clip.duration_ms == 40
+            assert any(ms == 20 for ms, _ in progress)
+            output.audio_state = QAudio.IdleState
+            wait_for(lambda: finished)
+            assert finished == [clip]
+        finally:
+            allow_finish.set()
 
 
 @pytest.mark.parametrize("partial", [False, True])

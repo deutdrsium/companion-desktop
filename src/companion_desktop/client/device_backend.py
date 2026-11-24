@@ -8,17 +8,13 @@ from PyQt5.QtCore import QTimer, pyqtSignal
 
 from ..avatar.local_vts import LocalVTS
 from ..avatar.model_catalog import load_mapping
+from ..avatar.motion import FRAME_PERIOD, cursor_offset
 from ..avatar.procedural import ProceduralAvatar
 from ..avatar.vts import VTSOutput
 from ..session.client import DesktopSession, HttpTransport
 from .legacy_backend import LegacyBackend
 
 log = logging.getLogger(__name__)
-
-
-def _relative_cursor(x, y, left, top, width, height, model_x=0.0, model_y=0.0):
-    # VTS window coordinates span [-1, 1] on each axis with positive Y up.
-    return 2 * (x - left) / width - 1 - model_x, 2 * (y - top) / height - 1 + model_y
 
 
 def _vts_cursor(model_position):
@@ -37,8 +33,8 @@ def _vts_cursor(model_position):
             and rect.right and rect.bottom and user32.ClientToScreen(window, byref(origin))
             and user32.GetCursorPos(byref(cursor))):
         # Read both the cursor and rectangle in the same native DPI coordinate space.
-        return _relative_cursor(cursor.x, cursor.y, origin.x, origin.y, rect.right, rect.bottom,
-                                model_position["positionX"], model_position["positionY"])
+        return cursor_offset(cursor.x, cursor.y, origin.x, origin.y, rect.right, rect.bottom,
+                             model_position["positionX"], model_position["positionY"])
     return None
 
 
@@ -102,8 +98,6 @@ class DeviceBackend(LegacyBackend):
         self.session.report("wardrobe_applied", body, session=self.session.session)
 
     async def _frames(self):
-        from ..avatar.motion import FRAME_PERIOD
-
         try:
             while True:
                 before = self.loop.time()
@@ -229,8 +223,8 @@ class DeviceBackend(LegacyBackend):
             self.avatar.pointer(None)
             return
         rect = screen.geometry()
-        self.avatar.pointer(_relative_cursor(position.x(), position.y(), rect.x(), rect.y(),
-                                             rect.width(), rect.height()))
+        self.avatar.pointer(cursor_offset(position.x(), position.y(), rect.x(), rect.y(),
+                                          rect.width(), rect.height()))
 
     def close(self, generation):
         self.timer.stop()
