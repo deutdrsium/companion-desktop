@@ -2,7 +2,9 @@ import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+from plugins.astrbot_plugin_desktop_access import session
 from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 from companion_desktop.contracts.types import PROTOCOL
 from companion_desktop.contracts.wire import MAX_REQUEST_BYTES, ProtocolError, encode_request, message
@@ -215,6 +217,64 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(chat.result.done)
         self.assertEqual(chat.cancelled, [turn_id, turn_id])
         self.assertEqual(exchange(turns=["msg-demo"])[0]["body"]["status"], "cancelled")
+
+    async def test_hung_turn_releases_binding_on_timeout_or_stop(self):
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+        for stop in (False, True):
+            with self.subTest(stop=stop), patch.object(session, "TURN_STOP_GRACE_SECONDS", 0.05):
+                release = asyncio.Event()
+                cancellation_started = asyncio.Event()
+
+                class HungChat(FakeChat):
+                    async def run(self, turn_id, text):
+                        try:
+                            return await super().run(turn_id, text)
+                        except asyncio.CancelledError:
+                            cancellation_started.set()
+                            await release.wait()
+                            return TurnResult("completed", "Late reply")
+
+                    async def cancel(self, turn_id):
+                        await super().cancel(turn_id)
+                        await release.wait()
+
+                host = SessionHost(turn_timeout_seconds=60 if stop else 0.05)
+                chat = HungChat(stop=False)
+                ref = host.handle(binding, "register", {"protocols": [PROTOCOL], "permissions": ["speak"]})["session"]
+
+                def exchange(*messages, turns=(), backend=chat):
+                    payload = {"session": ref, "messages": list(messages), "turns": list(turns)}
+                    return host.handle(binding, "exchange", payload, turns=backend)["messages"]
+
+                send = message("turn.send", ref, {"client_msg_id": "msg-demo", "text": "Hello"})
+                followup = message("turn.send", ref, {"client_msg_id": "msg-next", "text": "Next"})
+                try:
+                    accepted, = exchange(send)
+                    turn_id = accepted["body"]["turn_id"]
+                    self.assertEqual(exchange(followup)[0]["body"]["reason"], "busy")
+                    await self.wait_for(lambda: bool(chat.calls))
+                    if stop:
+                        cancel = message("turn.cancel", ref, {"turn_id": turn_id})
+                        self.assertEqual(exchange(cancel)[0]["body"]["status"], "unknown")
+
+                    await asyncio.wait_for(cancellation_started.wait(), 1)
+                    self.assertEqual(chat.cancelled, [turn_id] if stop else [])
+                    retry, failure = exchange(send)
+                    self.assertEqual(retry, accepted)
+                    self.assertEqual(failure["body"]["reason"], "result_unknown")
+                    self.assertEqual(chat.calls, [(turn_id, "Hello")])
+
+                    next_chat = FakeChat()
+                    next_chat.result.set_result(TurnResult("completed", "Next reply"))
+                    self.assertEqual(exchange(followup, backend=next_chat)[0]["type"], "turn.accepted")
+                    await self.wait_for(lambda: bool(next_chat.calls))
+                    self.assertEqual(exchange(turns=["msg-next"])[0]["body"]["text"], "Next reply")
+                    release.set()
+                    await self.wait_for(lambda: not host._tasks)
+                    self.assertEqual(exchange(turns=["msg-demo"])[0], failure)
+                finally:
+                    release.set()
+                    host.handle(binding, "disconnect", {"session": ref, "messages": [], "turns": []})
 
     async def test_exchange_splits_large_utf8_batch_and_drains_pending_messages(self):
         batches, events = [], []

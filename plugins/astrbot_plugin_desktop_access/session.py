@@ -18,6 +18,8 @@ from companion_desktop.session.dispatcher import OutputResult, result_body, task
 
 BATCH_LIMIT = 32
 LEASE_SECONDS = 20
+TURN_TIMEOUT_SECONDS = 450
+TURN_STOP_GRACE_SECONDS = 4
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,9 @@ class _Turn:
     backend: TurnBackend
     started: bool = False
     stop_requested: bool = False
-    stop_lookup_running: bool = False
+    task: asyncio.Task | None = None
+    deadline: asyncio.TimerHandle | None = None
+    stop_lookup: asyncio.Task | None = None
     result: TurnResult | None = None
 
 
@@ -103,9 +107,11 @@ class _Connection:
 
 
 class SessionHost:
-    def __init__(self, *, turn_claims_path=None, clock=monotonic, lease_seconds=LEASE_SECONDS):
+    def __init__(self, *, turn_claims_path=None, clock=monotonic, lease_seconds=LEASE_SECONDS,
+                 turn_timeout_seconds=TURN_TIMEOUT_SECONDS):
         self.clock = clock
         self.lease_seconds = lease_seconds
+        self.turn_timeout_seconds = turn_timeout_seconds
         self._claims = _Claims(turn_claims_path)
         self._connections = {}
         self._retired_receipts = OrderedDict()
@@ -117,6 +123,7 @@ class SessionHost:
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     def _refresh(self, connection):
         if connection.lease is not None:
@@ -410,31 +417,56 @@ class SessionHost:
                 return
             del self._turns[old]
 
+    def _finish_turn(self, turn, result):
+        if turn.result is not None:
+            return
+        turn.result = result
+        turn.deadline.cancel()
+        turn.deadline = None
+        turn.task = None
+        if turn.stop_lookup is not None:
+            turn.stop_lookup.cancel()
+            turn.stop_lookup = None
+        self._trim_turns()
+
+    def _expire_turn(self, turn):
+        task = turn.task
+        # Release the binding even if the backend stalls in cancellation cleanup.
+        self._finish_turn(turn, TurnResult("unknown"))
+        task.cancel()
+
     async def _run_turn(self, turn, text):
         if turn.stop_requested:
-            turn.result = TurnResult("cancelled")
-        else:
-            turn.started = True
-            try:
-                turn.result = await turn.backend.run(turn.turn_id, text)
-            except Exception:
-                turn.result = TurnResult("unknown" if turn.stop_requested else "failed")
-        self._trim_turns()
+            self._finish_turn(turn, TurnResult("cancelled"))
+            return
+        turn.started = True
+        try:
+            result = await turn.backend.run(turn.turn_id, text)
+        except asyncio.CancelledError:
+            self._finish_turn(turn, TurnResult("unknown"))
+            raise
+        except Exception:
+            result = TurnResult("unknown" if turn.stop_requested else "failed")
+        self._finish_turn(turn, result)
 
     async def _cancel_backend(self, turn):
         try:
             await turn.backend.cancel(turn.turn_id)
         except Exception:
             pass  # A stop request is not termination evidence.
-        finally:
-            turn.stop_lookup_running = False
 
     def _stop_turn(self, turn):
-        if turn.result is None:
+        if turn.result is not None:
+            return
+        if not turn.stop_requested:
             turn.stop_requested = True
-            if turn.started and not turn.stop_lookup_running:
-                turn.stop_lookup_running = True
-                self._spawn(self._cancel_backend(turn))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TURN_STOP_GRACE_SECONDS
+            if deadline < turn.deadline.when():
+                turn.deadline.cancel()
+                turn.deadline = loop.call_at(deadline, self._expire_turn, turn)
+        if turn.started and (turn.stop_lookup is None or turn.stop_lookup.done()):
+            turn.stop_lookup = self._spawn(self._cancel_backend(turn))
 
     def _send_turn(self, connection, body, backend):
         ref, key = connection.ref, connection.binding.key
@@ -456,7 +488,9 @@ class SessionHost:
         if turn_id == proposed:
             turn = _Turn(client_id, turn_id, backend)
             self._turns[key, client_id] = turn
-            self._spawn(self._run_turn(turn, text))
+            loop = asyncio.get_running_loop()
+            turn.deadline = loop.call_later(self.turn_timeout_seconds, self._expire_turn, turn)
+            turn.task = self._spawn(self._run_turn(turn, text))
         return message("turn.accepted", ref, ids)
 
     def _turn_results(self, connection, requested):
