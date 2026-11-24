@@ -9,7 +9,7 @@ import unittest
 
 from companion_desktop.avatar.model_actions import StaleOutputError
 from companion_desktop.avatar.model_catalog import InputBinding, ModelReadback, load_mapping
-from companion_desktop.avatar.motion import FRAME_PERIOD, PAUSE_GAP
+from companion_desktop.avatar.motion import FRAME_PERIOD, PAUSE_GAP, cursor_offset
 from companion_desktop.avatar.procedural import AnimatedSession, ProceduralAvatar
 from companion_desktop.avatar.vts import CHANNELS, VTSOutput
 from companion_desktop.contracts.wire import message
@@ -148,16 +148,10 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
     async def test_b01_hit_scoped_reflexes_dont_take_brows_and_handoff_stops_writes(self):
         rig = Rig()
         await rig.output.subscribe_events()
-        self.assertEqual(rig.vts.requests, ["EventSubscriptionRequest"] * 2)
+        self.assertEqual(rig.vts.requests, ["EventSubscriptionRequest"] * 3)
         rig.avatar.message_sent("message-demo")
-        await rig.frames(30)
-        rig.avatar.pointer(None)
-        rig.avatar.pointer((0.0, 0.0))
-        rig.avatar.pointer((0.7, -0.4))
-        glance = (await rig.frames(9))[-1]
-        self.assertGreater(glance["look_x"], 0.2)
-        self.assertLess(glance["brow_left"], -0.4)
-        settled = (await rig.frames(35))[-1]
+        settled = (await rig.frames(31))[-1]
+        self.assertLess(settled["brow_left"], -0.4)
         self.assertLess(settled["look_x"], -0.6)
         rig.avatar.handle_vts_event("ModelClickedEvent", {"loadedModelID": "other-demo", "modelWasClicked": True})
         self.assertLess((await rig.frames(10))[-1]["look_x"], -0.6)
@@ -170,6 +164,52 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         rig.avatar.set_enabled(True)
         self.assertGreater((await rig.step())["brow_left"], -0.1)
 
+    async def test_cursor_tracks_successive_positions_and_eases_back(self):
+        rig = Rig()
+        rig.avatar.message_sent("message-demo")
+        await rig.frames(25)
+        # The model is left and below this window's centre. Its origin, not the
+        # monitor centre, is the zero for pointer deltas.
+        def position(x, y):
+            return cursor_offset(x, y, 100, 200, 800, 600, -0.5, -0.5)
+
+        self.assertEqual(position(300, 650), (0, 0))
+        rig.avatar.pointer(position(300, 650))
+        rig.avatar.pointer(position(600, 410))  # right and up relative to the model
+        right_up = (await rig.frames(7))[-1]
+        self.assertGreater(right_up["look_x"], 0.65)
+        self.assertGreater(right_up["look_y"], 0.6)
+        self.assertGreater(right_up["head_yaw"], 3)
+        self.assertLess(right_up["brow_left"], -0.4)
+        self.assertAlmostEqual(rig.vts.frames[-1]["look_x"], -right_up["look_x"])
+        self.assertAlmostEqual(rig.vts.frames[-1]["look_y"], right_up["look_y"])
+
+        # Samples well below the former glance threshold all update the target.
+        rightward = []
+        for sample in range(8):
+            rig.avatar.pointer(position(370 + sample * 16, 580))
+            rightward.append((await rig.frames(2))[-1]["look_x"])
+        self.assertTrue(all(a < b for a, b in zip(rightward[2:], rightward[3:])))
+
+        rig.avatar.pointer(position(120, 880))  # rapidly reverse both axes
+        trajectory = await rig.frames(7)
+        self.assertTrue(all(a["look_y"] > b["look_y"] for a, b in zip(trajectory, trajectory[1:])))
+        left_down = trajectory[-1]
+        self.assertLess(left_down["look_x"], -0.35)
+        self.assertLess(left_down["look_y"], -0.6)
+        self.assertLess(left_down["head_yaw"], 0)
+        self.assertGreater(rig.vts.frames[-1]["look_x"], 0.35)
+        self.assertLess(rig.vts.frames[-1]["look_y"], -0.6)
+
+        rig.avatar.end_conversation()
+        tail = []
+        for _ in range(45):
+            rig.avatar.pointer(position(120, 880))  # unchanged samples must not renew follow
+            tail.append((await rig.step())["look_y"])
+        self.assertLess(tail[0], -0.6)
+        self.assertGreater(tail[-1], -0.1)
+        self.assertLess(max(abs(a - b) for a, b in zip(tail, tail[1:])), 0.1)
+
     async def test_b02_typed_turn_smiles_blinks_speaks_and_releases(self):
         rig = Rig()
         session = InMemorySession()
@@ -181,7 +221,10 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         rig.avatar.snapshot("role_state", rig.role(1, activity="reading"), deadline=rig.clock() + 30)
         rig.avatar.set_typing(True)
         listening = (await rig.frames(48))[-1]
-        self.assertGreater(listening["brow_left"], 0.13)
+        self.assertAlmostEqual(listening["brow_left"], 0.265, delta=0.01)
+        self.assertAlmostEqual(listening["brow_right"], 0.235, delta=0.01)
+        self.assertAlmostEqual(listening["head_roll"], 3.15, delta=0.02)
+        self.assertAlmostEqual(listening["head_pitch"], 1, delta=0.02)
         animated.send_message("message-demo", "Example message")
         turn_id = events[-1]["turn_id"]
         thinking = (await rig.frames(20))[-1]

@@ -8,14 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import companion_desktop  # noqa: E402,F401  (sets the Qt plugin path before PyQt5 loads)
 import pytest  # noqa: E402
-from PyQt5.QtCore import QSettings  # noqa: E402
+from PyQt5.QtCore import QCoreApplication, QEvent, QSettings  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 
 @pytest.fixture(scope="session")
-def qapp(tmp_path_factory):
-    QSettings.setDefaultFormat(QSettings.IniFormat)
-    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("settings")))
+def qapp():
     app = QApplication.instance() or QApplication([])
     from companion_desktop.ui import theme
     from companion_desktop.ui.paint import Animated
@@ -28,7 +26,10 @@ def qapp(tmp_path_factory):
 @pytest.fixture
 def prefs(qapp, tmp_path):
     from companion_desktop.ui.settings import Prefs
-    return Prefs("CompanionDesktopTest", tmp_path.name)
+    prefs = Prefs("CompanionDesktopTest", tmp_path.name)
+    # QSettings(org, app) uses the native store even after setDefaultFormat().
+    prefs.store = QSettings(str(tmp_path / "prefs.ini"), QSettings.IniFormat)
+    return prefs
 
 
 @pytest.fixture
@@ -43,3 +44,5 @@ def ctl(qapp, prefs):
     c.quitting = True
     c.panel.close()
     c.panel.deleteLater()
+    c.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

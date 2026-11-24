@@ -73,8 +73,10 @@ class LegacyBackend(QObject):
         self.screen_session = uuid4().hex
         self.cancelled = set()
         self.closed = False
-        threading.Thread(target=self._speech_loop, daemon=True, name="speech").start()
-        threading.Thread(target=self._sync_loop, daemon=True, name="playback-sync").start()
+        self._speech_thread = threading.Thread(target=self._speech_loop, daemon=True, name="speech")
+        self._sync_thread = threading.Thread(target=self._sync_loop, daemon=True, name="playback-sync")
+        self._speech_thread.start()
+        self._sync_thread.start()
 
     def set_base(self, base):
         self.base = base.rstrip("/")
@@ -179,8 +181,11 @@ class LegacyBackend(QObject):
             try:
                 data = self._request(self.api + "/speech", payload={"text": sentence}, timeout=90)
                 audio = base64.b64decode(data["audio"], validate=True)
-                self.audio.emit(generation, data["id"], index, sentence, audio, bool(data.get("mouth_available")))
+                if not self.closed and generation == self.generation:
+                    self.audio.emit(generation, data["id"], index, sentence, audio, bool(data.get("mouth_available")))
             except Exception as error:
+                if self.closed or generation != self.generation:
+                    continue
                 if isinstance(error, ConnectionLost):
                     self.unreachable.emit()
                 if generation == self.generation:

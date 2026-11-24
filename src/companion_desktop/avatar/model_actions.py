@@ -1,5 +1,6 @@
 """Plan and verify model state on the desktop output side of P0's contract."""
 
+import asyncio
 from dataclasses import dataclass
 from math import isclose
 from typing import Callable, Protocol
@@ -132,25 +133,35 @@ async def apply_state(
         ((file, active) for file, active in expected_expressions.items() if before.expressions[file] != active),
         key=lambda change: (change[1], change[0]),
     ))
-    after = before
-    if changes:
-        try:
-            await output.set_expressions(before, changes, is_current=is_current)
-            after = await output.read_model()
-        except StaleOutputError:
-            return _stale()
-        except OSError:
-            return _unknown("write_or_readback_lost")
-    if after.epoch != before.epoch or not catalog.matches(after):
-        return _unknown("model_changed_before_verification")
-    if any(after.expressions.get(file) is not active for file, active in expected_expressions.items()):
-        return _unknown("expression_state_unconfirmed")
-    if any(
-        parameter not in after.parameters or not isclose(after.parameters[parameter], value, rel_tol=0, abs_tol=0.02)
-        for parameter, value in expected_parameters.items()
-    ):
-        return _unknown("parameter_state_unconfirmed")
-    return ActionResult("completed", evidence={"source": "vts_model_readback", "ref": after.ref})
+    def verify(after):
+        if not is_current() or after.epoch != before.epoch or not catalog.matches(after):
+            return _unknown("model_changed_before_verification")
+        if any(after.expressions.get(file) is not active for file, active in expected_expressions.items()):
+            return _unknown("expression_state_unconfirmed")
+        if any(
+            parameter not in after.parameters or not isclose(after.parameters[parameter], value, rel_tol=0, abs_tol=0.02)
+            for parameter, value in expected_parameters.items()
+        ):
+            return _unknown("parameter_state_unconfirmed")
+        return ActionResult("completed", evidence={"source": "vts_model_readback", "ref": after.ref})
+
+    if not changes:
+        return verify(before)
+    try:
+        await output.set_expressions(before, changes, is_current=is_current)
+        # The activation ACK can precede the next render. An old expression
+        # activated elsewhere can still be fading out (VTS allows up to 2 s).
+        await asyncio.sleep(0.05)
+        result = verify(await output.read_model())
+        if result.detail in {"expression_state_unconfirmed", "parameter_state_unconfirmed"}:
+            await asyncio.sleep(2)
+            if is_current():
+                result = verify(await output.read_model())
+        return result
+    except StaleOutputError:
+        return _stale()
+    except OSError:
+        return _unknown("write_or_readback_lost")
 
 
 async def trigger_event(

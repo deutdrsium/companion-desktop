@@ -6,8 +6,13 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from companion_desktop.avatar import model_actions
+from companion_desktop.avatar.local_vts import LocalVTS
 from companion_desktop.avatar.model_actions import ModelSelection, StaleOutputError
 from companion_desktop.avatar.model_catalog import MappingError, ModelReadback, load_mapping
+from companion_desktop.avatar.procedural import ProceduralAvatar
+from companion_desktop.avatar.vts import VTSOutput
+from companion_desktop.session.client import DesktopSession
+from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost
 
 
 apply_state = partial(model_actions.apply_state, is_current=lambda: True)
@@ -200,3 +205,92 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         self.output.read_model = conflicting_read
         result = await apply_state(self.catalog, ModelSelection(activity="drawing"), self.output)
         self.assertEqual((result.status, result.detail), ("unknown", "parameter_state_unconfirmed"))
+
+    async def test_device_snapshot_uses_vts_and_reports_readback_across_model_reload(self):
+        state = self.output
+        state.expressions.update({"demo-casual.exp3.json": True, "demo-sketch.exp3.json": True,
+                                  "demo-pin.exp3.json": True})
+        activations = []
+
+        async def request(kind, data, *, is_current=lambda: True):
+            if not is_current():
+                raise StaleOutputError
+            model = await state.read_model()
+            if kind == "CurrentModelRequest":
+                return {"modelLoaded": True, "modelID": model.model_id}
+            if kind == "InputParameterListRequest":
+                return {"defaultParameters": [{"name": name} for name in model.inputs], "customParameters": []}
+            if kind == "ExpressionStateRequest":
+                return {"expressions": [{"file": file, "active": active} for file, active in model.expressions.items()]}
+            if kind == "HotkeysInCurrentModelRequest":
+                return {"availableHotkeys": [{"file": file, "type": "TriggerAnimation", "hotkeyID": hotkey}
+                                             for hotkey, file in model.animation_hotkeys.items()]}
+            if kind == "Live2DParameterListRequest":
+                return {"parameters": [{"name": key, "value": value} for key, value in model.parameters.items()]}
+            assert kind == "ExpressionActivationRequest" and data["fadeTime"] == 0
+            file, active = data["expressionFile"], data["active"]
+            activations.append((file, active))
+            state.expressions[file] = active
+
+        local = LocalVTS(8001, None)
+        local.request = request
+        output = VTSOutput(request, owned=())  # wardrobe does not require any continuous inputs
+        observed = await local._read_model(self.catalog, "epoch-demo-1")
+        self.assertEqual(observed.animation_hotkeys, state.hotkeys)
+        output.bind(self.catalog, observed)
+        avatar = ProceduralAvatar(output, wardrobe_report=lambda body: desktop.report(
+            "wardrobe_applied", body, session=desktop.session))
+        avatar.set_enabled(False)
+        host = SessionHost()
+        binding = Binding("device-demo", "binding-demo", frozenset({"avatar"}))
+        desired = {"revision": 1, "model_id": state.model_id, "asset_version": state.asset_version,
+                   "selection": {"outfit": "jacket"}, "mapping": None, "updated_at": "2026-01-01T12:00:00Z"}
+
+        async def transport(operation, payload):
+            return host.handle(binding, operation, payload,
+                               snapshots=lambda caps: [("wardrobe", desired)] if caps["model_id"] == desired["model_id"] else [])
+
+        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar)
+        self.addAsyncCleanup(desktop.close)
+
+        def publish(revision):
+            desktop.publish_capabilities({**avatar.capabilities(revision), "observations": [], "games": []})
+
+        publish(1)
+        self.assertEqual([action["name"] for action in avatar.capabilities(1)["avatar"]["actions"]],
+                         ["outfit.casual", "outfit.jacket"])
+        await desktop._register()
+        await desktop._exchange()
+        avatar.set_enabled(True)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        await desktop._exchange()
+        receipt = host.wardrobe_applied(desktop.session)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["evidence"]["source"], "vts_model_readback")
+        self.assertEqual(activations, [("demo-casual.exp3.json", False), ("demo-jacket.exp3.json", True)])
+        self.assertTrue(state.expressions["demo-sketch.exp3.json"])
+        self.assertTrue(state.expressions["demo-pin.exp3.json"])
+
+        avatar.handle_vts_event("ModelLoadedEvent", {})
+        publish(2)
+        await desktop._exchange()
+        self.assertIsNone(host.wardrobe_applied(desktop.session))
+        state.expressions["demo-jacket.exp3.json"] = False
+        output.bind(self.catalog, await local._read_model(self.catalog, "epoch-demo-2"))
+        publish(3)
+        await desktop._exchange()
+        await avatar.tick()
+        await avatar._wardrobe_task
+        await desktop._exchange()
+        self.assertEqual(host.wardrobe_applied(desktop.session)["status"], "completed")
+        self.assertEqual(activations[2:], [("demo-jacket.exp3.json", True)])
+
+        desired.update(revision=2, selection={"outfit": "unmapped-demo"})
+        await desktop._exchange()
+        await avatar.tick()
+        await avatar._wardrobe_task
+        await desktop._exchange()
+        receipt = host.wardrobe_applied(desktop.session)
+        self.assertEqual((receipt["status"], receipt["reason_code"]), ("unsupported", "unmapped_outfit"))
+        self.assertEqual(len(activations), 3)

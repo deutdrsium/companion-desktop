@@ -2,17 +2,40 @@
 
 import asyncio
 import logging
+import sys
 
 from PyQt5.QtCore import QTimer, pyqtSignal
 
 from ..avatar.local_vts import LocalVTS
 from ..avatar.model_catalog import load_mapping
+from ..avatar.motion import FRAME_PERIOD, cursor_offset
 from ..avatar.procedural import ProceduralAvatar
 from ..avatar.vts import VTSOutput
 from ..session.client import DesktopSession, HttpTransport
 from .legacy_backend import LegacyBackend
 
 log = logging.getLogger(__name__)
+
+
+def _vts_cursor(model_position):
+    if sys.platform != "win32":
+        return None
+    from ctypes import byref, windll, wintypes
+
+    user32 = windll.user32
+    user32.FindWindowW.restype = wintypes.HWND
+    handle = user32.FindWindowW(None, "VTube Studio")
+    if not handle:
+        return None
+    window = wintypes.HWND(handle)
+    rect, origin, cursor = wintypes.RECT(), wintypes.POINT(), wintypes.POINT()
+    if (not user32.IsIconic(window) and user32.GetClientRect(window, byref(rect))
+            and rect.right and rect.bottom and user32.ClientToScreen(window, byref(origin))
+            and user32.GetCursorPos(byref(cursor))):
+        # Read both the cursor and rectangle in the same native DPI coordinate space.
+        return cursor_offset(cursor.x, cursor.y, origin.x, origin.y, rect.right, rect.bottom,
+                             model_position["positionX"], model_position["positionY"])
+    return None
 
 
 class DeviceBackend(LegacyBackend):
@@ -27,7 +50,7 @@ class DeviceBackend(LegacyBackend):
         self.timer.setInterval(10)
         self.timer.timeout.connect(self._pump)
         self.cursor_timer = QTimer(self)
-        self.cursor_timer.setInterval(80)
+        self.cursor_timer.setInterval(40)
         self.cursor_timer.timeout.connect(self._cursor)
         self.avatar = self.vts = self.catalog = None
         self.revision = 1
@@ -36,12 +59,12 @@ class DeviceBackend(LegacyBackend):
         self.cancel_pending = set()
         self.tasks = []
         mapping = cfg["avatar"].get("mapping")
-        if mapping and cfg["avatar"]["inputs"]:
+        if mapping:
             try:
                 self.catalog = load_mapping(mapping)
                 self.vts = LocalVTS(int(cfg["avatar"]["port"]), folder / "vts-token")
                 output = VTSOutput(self.vts.request, owned=cfg["avatar"]["inputs"])
-                self.avatar = ProceduralAvatar(output)
+                self.avatar = ProceduralAvatar(output, wardrobe_report=self._report_wardrobe)
                 self.avatar.set_enabled(False)
             except (OSError, ValueError):
                 log.warning("Local avatar mapping unavailable")
@@ -71,17 +94,21 @@ class DeviceBackend(LegacyBackend):
         self.session.publish_capabilities({**avatar, "observations": [], "games": [],
                                            "tts": self.tts, "subtitle": self.subtitle})
 
-    async def _frames(self):
-        from ..avatar.motion import FRAME_PERIOD
+    def _report_wardrobe(self, body):
+        self.session.report("wardrobe_applied", body, session=self.session.session)
 
-        while True:
-            before = self.loop.time()
-            self.avatar.set_enabled(self.session.connection["state"] == "connected"
-                                    and "avatar" in self.session.dispatcher.permissions
-                                    and self.session.capabilities_published(self.revision)
-                                    and bool(self.avatar.output.bindings))
-            await self.avatar.tick()
-            await asyncio.sleep(max(0, FRAME_PERIOD - (self.loop.time() - before)))
+    async def _frames(self):
+        try:
+            while True:
+                before = self.loop.time()
+                self.avatar.set_enabled(self.session.connection["state"] == "connected"
+                                        and "avatar" in self.session.dispatcher.permissions
+                                        and self.session.capabilities_published(self.revision)
+                                        and self.avatar.output.observed is not None)
+                await self.avatar.tick()
+                await asyncio.sleep(max(0, FRAME_PERIOD - (self.loop.time() - before)))
+        finally:
+            await self.avatar.stop_wardrobe()
 
     def _pump(self):
         self.loop.call_soon(self.loop.stop)
@@ -180,17 +207,24 @@ class DeviceBackend(LegacyBackend):
         return turn_id, self.cues.pop(turn_id, ())
 
     def _cursor(self):
-        """Feed the desktop cursor, relative to its screen centre, to gaze following."""
+        """Use the live VTS model origin, falling back to the cursor's screen."""
         from PyQt5.QtGui import QCursor, QGuiApplication
 
+        observed = self.avatar.output.observed
+        model = self.vts.model_position
+        if observed is not None and model is not None and model[0] == observed.model_id:
+            aim = _vts_cursor(model[1])
+            if aim is not None:
+                self.avatar.pointer(aim)
+                return
         position = QCursor.pos()
         screen = QGuiApplication.screenAt(position)
         if screen is None:
+            self.avatar.pointer(None)
             return
         rect = screen.geometry()
-        x = (position.x() - rect.center().x()) / max(1, rect.width() / 2)
-        y = (position.y() - rect.center().y()) / max(1, rect.height() / 2)
-        self.avatar.pointer((max(-1.0, min(1.0, x)), max(-1.0, min(1.0, y))))
+        self.avatar.pointer(cursor_offset(position.x(), position.y(), rect.x(), rect.y(),
+                                          rect.width(), rect.height()))
 
     def close(self, generation):
         self.timer.stop()

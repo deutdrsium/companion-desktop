@@ -20,10 +20,17 @@ THINKING = {
     "head_roll": -5.5, "look_x": -0.63, "look_y": 0.37,
     "brow_left": -0.46, "brow_right": 0.20, "mouth_form": -0.52,
 }
-LISTENING = {"brow_left": 0.38, "brow_right": 0.34, "head_roll": 4.5, "head_pitch": 2.0}
-FOLLOW_SECONDS = 2.5  # how long gaze keeps following after the pointer stops
+LISTENING = {"brow_left": 0.265, "brow_right": 0.235, "head_roll": 3.15, "head_pitch": 1.0}
+FOLLOW_HOLD = 0.25  # allow for the interval between pointer samples
+FOLLOW_RELEASE = 0.85
 LAUGH = {"eye_left": 0.72, "eye_right": 0.72, "eye_smile": 0.85, "mouth_form": 0.87}
 GESTURE_SECONDS = {"hold_laugh": 2.8, "nod": 0.65, "head_tilt": 1.05}
+
+
+def cursor_offset(x, y, left, top, width, height, model_x=0.0, model_y=0.0):
+    """Normalize screen pixels relative to the VTS model origin (positive Y down)."""
+    # Each window axis spans [-1, 1]; the model-position Y from VTS points up.
+    return 2 * (x - left) / width - 1 - model_x, 2 * (y - top) / height - 1 + model_y
 
 
 def unit(value):
@@ -67,29 +74,23 @@ class Motion:
         self._lid = 1.0
         self._reflex = None
         self._last_pointer = None
-        self._follow = None  # (position, seen_at) of the latest desktop pointer
-        self._next_pointer = 0.0
+        self._follow = None  # (position, moved_at) of the latest desktop pointer movement
         self._next_click = 0.0
 
     def _delay(self, minimum, mean):
         return minimum + self._random.expovariate(1 / mean)
 
     def pointer(self, position):
-        """Accept mapped model-window coordinates in [-1, 1], or None outside it."""
+        """Accept window-relative coordinates with positive X right and Y down."""
         previous, self._last_pointer = self._last_pointer, position
-        if position is not None and position != previous:
+        if previous is not None and position is not None and position != previous:
             self._follow = (position, self.time)
-        if position is None or previous is None or self.time < self._next_pointer:
-            return
-        if max(abs(a - b) for a, b in zip(previous, position)) >= 0.18:
-            self._next_pointer = self.time + self._delay(3.5, 1.8)
-            self._reflex = (self.time, 0.65, tuple(0.42 * (2 * unit((n + 1) / 2) - 1) for n in position), 0.10, 0.20)
+            self._reflex = None
 
     def click(self):
         if self.time < self._next_click:
             return
         self._next_click = self.time + 1.4
-        self._next_pointer = self.time + 1.0
         # A click is a soft glance back, not a snap.
         self._reflex = (self.time, 1.4, (0.0, 0.06), 0.30, 0.45)
 
@@ -104,19 +105,19 @@ class Motion:
     def clear_reflexes(self):
         self.typing = self.thinking = False
         self.reply_smile_until = 0.0
-        self._reflex = self._last_pointer = None
+        self._reflex = self._last_pointer = self._follow = None
         self.stop_mouth()
 
     def reset_pose(self):
         self.values = NEUTRAL.copy()
         self._lid = 1.0
         self._blink_start = self.time + self._delay(1.5, 2.0)
-        self._next_click = self._next_pointer = self.time
+        self._next_click = self.time
 
     def advance(self, elapsed, now, gestures):
         if elapsed >= PAUSE_GAP:
             self._remaining = 0.0
-            self._reflex = self._last_pointer = None
+            self._reflex = self._last_pointer = self._follow = None
             self.reply_smile_until = 0.0
             self._blink_start = self.time + self._delay(1.5, 2.0)
             self.stop_mouth()
@@ -184,19 +185,26 @@ class Motion:
             "eye_smile": 0.17 * happiness, "mouth_form": 0.26 * happiness,
             "mouth_open": self.mouth_target,
         }
-        if self._follow is not None and t - self._follow[1] < FOLLOW_SECONDS and not self.thinking:
-            (px, py), seen = self._follow
-            weight = ease((FOLLOW_SECONDS - (t - seen)) / 0.8)
-            targets["look_x"] += weight * (0.75 * px - targets["look_x"])
-            targets["look_y"] += weight * (-0.6 * py - targets["look_y"])
-            targets["head_yaw"] += weight * 9.0 * px
-            targets["head_pitch"] += weight * -5.0 * py
         if self.thinking:
             targets.update(THINKING)
             targets["eye_left"] *= 0.97
             targets["eye_right"] *= 0.97
         elif self.typing:
             targets.update(LISTENING)
+        if self._follow is not None:
+            (px, py), moved = self._follow
+            weight = ease(1 - (t - moved - FOLLOW_HOLD) / FOLLOW_RELEASE)
+            if weight == 0:
+                self._follow = None
+            else:
+                # Cubism +X is screen-right, +Y is up. VTSOutput handles
+                # inversions in the tracking-input mapping, not in the pose.
+                x = 2 * unit((px + 1) / 2) - 1
+                y = 2 * unit((1 - py) / 2) - 1
+                targets["look_x"] += weight * (x - targets["look_x"])
+                targets["look_y"] += weight * (0.9 * y - targets["look_y"])
+                targets["head_yaw"] += weight * 8.0 * x
+                targets["head_pitch"] += weight * 4.0 * y
 
         laugh = gestures.get("hold_laugh")
         strength = 0.0
