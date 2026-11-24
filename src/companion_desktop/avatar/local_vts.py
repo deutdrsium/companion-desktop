@@ -23,6 +23,7 @@ class LocalVTS:
         self.pending = {}
         self.changed = asyncio.Event()
         self.token_requested = False
+        self.model_position = None
 
     async def request(self, kind, data, *, is_current=lambda: True, timeout=3):
         if self.socket is None:
@@ -53,7 +54,11 @@ class LocalVTS:
                 elif frame["messageType"] in {"ModelLoadedEvent", "ModelClickedEvent"}:
                     event(frame["messageType"], frame["data"])
                     if frame["messageType"] == "ModelLoadedEvent":
+                        self.model_position = None
                         self.changed.set()
+                elif frame["messageType"] == "ModelMovedEvent":
+                    data = frame["data"]
+                    self.model_position = (data["modelID"], data["modelPosition"])
         finally:
             for reply in self.pending.values():
                 if not reply.done():
@@ -82,11 +87,16 @@ class LocalVTS:
         model = await self.request("CurrentModelRequest", {})
         if not model["modelLoaded"] or model["modelID"] != catalog.model_id:
             return None
+        if self.model_position is None and model.get("modelPosition") is not None:
+            self.model_position = (model["modelID"], model["modelPosition"])
         inputs = await self.request("InputParameterListRequest", {})
+        expressions = await self.request("ExpressionStateRequest", {"details": False})
+        hotkeys = await self.request("HotkeysInCurrentModelRequest", {})
         parameters = await self.request("Live2DParameterListRequest", {})
         return ModelReadback.from_vts(epoch=epoch, ref=uuid4().hex, model=model, asset_version=catalog.asset_version,
                                       inputs=inputs["defaultParameters"] + inputs["customParameters"],
-                                      parameters=parameters["parameters"], expressions=(), hotkeys=())
+                                      parameters=parameters["parameters"], expressions=expressions["expressions"],
+                                      hotkeys=hotkeys["availableHotkeys"])
 
     async def run(self, catalog, avatar, publish):
         output = avatar.output
@@ -99,10 +109,9 @@ class LocalVTS:
                         if not await self._authenticate():
                             return
                         await output.subscribe_events()
-                        epoch = uuid4().hex
                         while not listener.done():
                             self.changed.clear()
-                            observed = await self._read_model(catalog, epoch)
+                            observed = await self._read_model(catalog, uuid4().hex)
                             if self.changed.is_set():
                                 continue
                             if observed is not None:
@@ -120,6 +129,7 @@ class LocalVTS:
                 log.debug("Local VTS session unavailable")
             finally:
                 self.socket = None
+                self.model_position = None
                 output.invalidate()
                 publish()
             await asyncio.sleep(2)

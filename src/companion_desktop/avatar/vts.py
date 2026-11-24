@@ -1,5 +1,8 @@
 """Frame adapter for an authenticated, local VTube Studio API connection."""
 
+from dataclasses import replace
+from uuid import uuid4
+
 from .model_actions import StaleOutputError
 from .motion import NEUTRAL, unit
 
@@ -31,13 +34,13 @@ class VTSOutput:
     def __init__(self, request, *, owned):
         self._request = request
         self._owned = frozenset(owned)
-        self.observed = None
+        self.observed = self.catalog = None
         self.bindings = {}
         self.generation = 0
 
     def invalidate(self):
         self.generation += 1
-        self.observed = None
+        self.observed = self.catalog = None
         self.bindings = {}
 
     def bind(self, catalog, observed):
@@ -56,14 +59,55 @@ class VTSOutput:
                     and binding.output_range[0] != binding.output_range[1]):
                 self.bindings[channel] = binding
                 reserved.add(binding.input_id)
-        self.observed = observed
+        self.observed, self.catalog = observed, catalog
 
     async def subscribe_events(self):
         generation = self.generation
-        for event, config in (("ModelLoadedEvent", {}), ("ModelClickedEvent", {"onlyClicksOnModel": True})):
+        for event, config in (("ModelLoadedEvent", {}), ("ModelMovedEvent", {}),
+                              ("ModelClickedEvent", {"onlyClicksOnModel": True})):
             await self._request("EventSubscriptionRequest", {
                 "eventName": event, "subscribe": True, "config": config,
             }, is_current=lambda: self.generation == generation)
+
+    async def read_model(self):
+        observed = self.observed
+        if observed is None:
+            raise OSError("No mapped VTS model")
+        current = lambda: self.observed is observed
+        try:
+            model = await self._request("CurrentModelRequest", {}, is_current=current)
+            if not model["modelLoaded"] or model["modelID"] != observed.model_id:
+                raise OSError("VTS model changed")
+            expressions = await self._request("ExpressionStateRequest", {"details": False}, is_current=current)
+            parameters = await self._request("Live2DParameterListRequest", {}, is_current=current)
+        except StaleOutputError as error:
+            raise OSError("VTS model changed") from error
+        if not current():
+            raise OSError("VTS model changed")
+        return replace(observed, ref=uuid4().hex,
+                       expressions={row["file"]: row["active"] for row in expressions["expressions"]},
+                       parameters={row["name"]: row["value"] for row in parameters["parameters"]})
+
+    async def set_expressions(self, observed, changes, *, is_current):
+        def current():
+            return self.observed is not None and self.observed.epoch == observed.epoch and is_current()
+
+        for index, (file, active) in enumerate(changes):
+            try:
+                await self._request("ExpressionActivationRequest", {
+                    "expressionFile": file, "active": active, "fadeTime": 0,
+                }, is_current=current)
+            except StaleOutputError as error:
+                if index:
+                    raise OSError("VTS expression batch interrupted") from error
+                raise
+
+    async def trigger_animation(self, observed, hotkey_id, *, is_current):
+        def current():
+            return self.observed is not None and self.observed.epoch == observed.epoch and is_current()
+
+        await self._request("HotkeyTriggerRequest", {"hotkeyID": hotkey_id}, is_current=current)
+        return uuid4().hex
 
     async def write(self, frame, *, is_current):
         observed = self.observed

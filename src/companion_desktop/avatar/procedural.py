@@ -7,8 +7,9 @@ from math import isfinite
 from time import monotonic
 from typing import Callable
 
+from companion_desktop.contracts.wire import now_utc
 from companion_desktop.session.dispatcher import OutputResult
-from .model_actions import StaleOutputError
+from .model_actions import ActionResult, ModelSelection, StaleOutputError, apply_state
 from .motion import FRAME_PERIOD, GESTURE_SECONDS, LAUGH, PAUSE_GAP, Motion, unit
 
 
@@ -34,10 +35,11 @@ class ProceduralAvatar:
 
     The host lease controls gestures/snapshots, not local idle. Local takeover
     disables all injection; cancel/stop closes owned mouth on the next batch.
-    No wardrobe, activity expression, or physics writes originate here.
+    Persistent outfits use the same VTS connection but a separate expression
+    channel, leaving continuous animation, activity and accessories alone.
     """
 
-    def __init__(self, output, *, clock=monotonic, seed=None):
+    def __init__(self, output, *, wardrobe_report=None, clock=monotonic, seed=None):
         self.output = output
         self.clock = clock
         self.motion = Motion(seed=seed)
@@ -49,6 +51,8 @@ class ProceduralAvatar:
         self._enabled = True
         self._client_id = self._turn_id = None
         self._turn_deadline = 0.0
+        self._wardrobe_report = wardrobe_report
+        self._wardrobe = self._wardrobe_task = None
 
     def _supported(self):
         bindings = self.output.bindings
@@ -63,12 +67,17 @@ class ProceduralAvatar:
 
     def capabilities(self, revision):
         observed = self.output.observed
+        actions = [{"name": name, "binding": binding} for name, binding in self._supported().items()]
+        if observed is not None and self._wardrobe_report is not None:
+            catalog = self.output.catalog
+            actions.extend(action for action in catalog.avatar_capabilities(observed)["actions"]
+                           if action["name"].startswith("outfit."))
         return {
             "revision": revision, "model_id": observed.model_id if observed else None,
             "asset_version": observed.asset_version if observed else None,
             "avatar": {
                 "inputs": sorted(binding.input_id for binding in self.output.bindings.values()),
-                "actions": [{"name": name, "binding": binding} for name, binding in self._supported().items()],
+                "actions": actions,
                 "hotkeys": [],
             },
             "mouth": "mouth_open" in self.output.bindings,
@@ -135,6 +144,7 @@ class ProceduralAvatar:
         self._revision += 1
         self._stop_gestures(reason)
         self._client_id = self._turn_id = None
+        self._wardrobe = None
         self.motion.clear_reflexes()
         if reason in {"unauthorized", "permissions_changed"}:
             self.motion.role_state = None
@@ -143,12 +153,49 @@ class ProceduralAvatar:
         """Local handoff. No new writes are issued while another owner has control."""
         if self._enabled != enabled:
             self._enabled = enabled
-            self.release("local_takeover")
+            if not enabled:
+                self.release("local_takeover")
             self.motion.reset_pose()
 
     def snapshot(self, kind, body, *, deadline):
         if kind == "role_state":
             self.motion.role_state = (body, deadline)
+        elif kind == "wardrobe" and self._wardrobe_report is not None:
+            self._sync_model()
+            self._wardrobe = body
+
+    async def _apply_wardrobe(self, body):
+        observed = self.output.observed
+
+        def current():
+            return self._enabled and self._wardrobe is body and self.output.observed is observed
+
+        try:
+            selection = body["selection"]
+            if observed is None or not current() or (body["model_id"], body["asset_version"]) != (
+                    observed.model_id, observed.asset_version):
+                return
+            if isinstance(selection, dict) and selection.keys() == {"outfit"} and isinstance(selection["outfit"], str):
+                result = await apply_state(self.output.catalog, ModelSelection(outfit=selection["outfit"]),
+                                           self.output, is_current=current)
+            else:
+                result = ActionResult("unsupported", "unmapped_outfit")
+            if current():
+                # Session/capability replacement releases this snapshot before
+                # a receipt could be attributed to another owner.
+                reason = result.detail if result.status == "unsupported" and result.detail else result.reason_code
+                self._wardrobe_report({**{key: body[key] for key in ("model_id", "asset_version", "revision")},
+                                       "status": result.status, "reason_code": reason,
+                                       "evidence": result.evidence, "occurred_at": now_utc()})
+        finally:
+            if self._wardrobe is body:
+                self._wardrobe = None
+            self._wardrobe_task = None
+
+    async def stop_wardrobe(self):
+        if self._wardrobe_task is not None:
+            self._wardrobe_task.cancel()
+            await asyncio.gather(self._wardrobe_task, return_exceptions=True)
 
     def _sync_model(self):
         if self._generation != self.output.generation:
@@ -221,6 +268,8 @@ class ProceduralAvatar:
     async def tick(self):
         """Sample once. Calls are serialized by run(), never queued to catch up."""
         self._sync_model()
+        if self._enabled and self._wardrobe is not None and self._wardrobe_task is None:
+            self._wardrobe_task = asyncio.create_task(self._apply_wardrobe(self._wardrobe))
         now = self.clock()
         elapsed = 0.0 if self._last_frame is None else now - self._last_frame
         self._last_frame = now
@@ -280,6 +329,7 @@ class ProceduralAvatar:
                 await asyncio.sleep(max(0, FRAME_PERIOD - (self.clock() - start)))
         finally:
             self.release("stopped")
+            await self.stop_wardrobe()
 
 
 class AnimatedSession:
