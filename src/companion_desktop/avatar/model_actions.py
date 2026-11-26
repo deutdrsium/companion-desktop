@@ -166,7 +166,7 @@ async def apply_state(
 async def trigger_event(
     catalog: ModelCatalog, name: str, output: ModelOutput, *, is_current: Callable[[], bool],
 ) -> ActionResult:
-    """Send a current event once. P1 owns the task ledger, including lost acknowledgements."""
+    """Send a current event once and confirm dispatch with the VTS acknowledgement."""
     try:
         current = await output.read_model()
     except OSError:
@@ -184,4 +184,4 @@ async def trigger_event(
         return _stale()
     except OSError:
         return _unknown("event_acknowledgement_lost")
-    return ActionResult("accepted", evidence={"source": "vts_hotkey_ack", "ref": ref})
+    return ActionResult("completed", evidence={"source": "vts_hotkey_ack", "ref": ref})

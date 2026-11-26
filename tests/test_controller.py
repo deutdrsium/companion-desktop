@@ -160,6 +160,29 @@ def test_speech_start_timeout_releases_synthesis_and_ignores_late_audio(ctl):
     assert not c.player.queue
 
 
+def test_speech_start_timeout_preserves_queued_turn_and_its_timeout(ctl):
+    c = ctl
+    c.send("First message")
+    first = c.backend.last_turn()
+    c.send("Second message")
+    c.backend.chat_done.emit(first, "First reply.")
+    assert len(c.backend.chats) == 1
+
+    c.state._grace.timeout.emit()
+    second = c.backend.last_turn()
+    assert second != first and c.active_turn == second
+    assert c.state.turn_id == second and c.state.presence == "thinking"
+    assert replies(c)[0].mode == "speech_failed"
+
+    c.backend.chat_done.emit(second, "Second reply.")
+    assert c.state._grace.isActive()
+    generation = c.reading_gen
+    c.state._grace.timeout.emit()
+    assert c.state.presence == "idle"
+    assert replies(c)[-1].mode == "speech_failed"
+    assert c.reading_gen is None and c.backend.generation > generation
+
+
 def test_typing_while_speaking_stops_her(ctl):
     c = ctl
     c.send("hi")

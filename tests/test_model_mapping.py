@@ -157,7 +157,7 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconnect_restores_latest_persistent_state_without_events(self):
         event = await trigger_event(self.catalog, "spark", self.output)
-        self.assertEqual(event.status, "accepted")
+        self.assertEqual(event.status, "completed")
         self.assertEqual(event.evidence["source"], "vts_hotkey_ack")
         self.output.epoch = "epoch-demo-2"
         latest = ModelSelection(activity="drawing", outfit="jacket", expressions=frozenset({"glitter"}))
@@ -208,12 +208,46 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         result = await apply_state(self.catalog, ModelSelection(activity="drawing"), self.output)
         self.assertEqual((result.status, result.detail), ("unknown", "parameter_state_unconfirmed"))
 
+    async def test_role_activity_restores_last_confirmed_pose_after_superseding_a_write(self):
+        state = self.output
+        output = VTSOutput(None, owned=())
+        output.bind(self.catalog, await state.read_model())
+        output.read_model = state.read_model
+        avatar = ProceduralAvatar(output)
+        idle = {"activity": "idle", "energy": None, "sleepiness": None, "emotion": None}
+
+        async def set_expressions(observed, changes, *, is_current):
+            await state.set_expressions(observed, changes, is_current=is_current)
+            if ("demo-sketch.exp3.json", True) in changes:
+                avatar.snapshot("role_state", idle, deadline=avatar.clock() + 5)
+
+        output.set_expressions = set_expressions
+        avatar.snapshot("role_state", idle, deadline=avatar.clock() + 5)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-idle.exp3.json"])
+
+        avatar.snapshot("role_state", {**idle, "activity": "drawing"}, deadline=avatar.clock() + 5)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-sketch.exp3.json"])
+        await avatar.tick()
+        self.assertIsNotNone(avatar._wardrobe_task)
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-idle.exp3.json"])
+        self.assertFalse(state.expressions["demo-sketch.exp3.json"])
+        self.assertEqual(len(state.expression_writes), 3)
+
     async def test_device_snapshot_uses_vts_and_reports_readback_across_model_reload(self):
         state = self.output
         state.expressions.update({"demo-casual.exp3.json": True, "demo-sketch.exp3.json": True,
                                   "demo-pin.exp3.json": True})
         activations = []
         hotkey_writes = []
+        elapsed = 0
+
+        def clock():
+            return elapsed
 
         async def request(kind, data, *, is_current=lambda: True):
             if not is_current():
@@ -246,10 +280,10 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         observed = await local._read_model(self.catalog, "epoch-demo-1")
         self.assertEqual(observed.animation_hotkeys, state.hotkeys)
         output.bind(self.catalog, observed)
-        avatar = ProceduralAvatar(output, wardrobe_report=lambda body: desktop.report(
+        avatar = ProceduralAvatar(output, clock=clock, wardrobe_report=lambda body: desktop.report(
             "wardrobe_applied", body, session=desktop.session))
         avatar.set_enabled(False)
-        host = SessionHost()
+        host = SessionHost(clock=clock)
         binding = Binding("device-demo", "binding-demo", frozenset({"avatar"}))
         desired = {"revision": 1, "model_id": state.model_id, "asset_version": state.asset_version,
                    "selection": {"outfit": "jacket"}, "mapping": None, "updated_at": "2026-01-01T12:00:00Z"}
@@ -258,14 +292,17 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
             return host.handle(binding, operation, payload,
                                snapshots=lambda caps: [("wardrobe", desired)] if caps["model_id"] == desired["model_id"] else [])
 
-        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar)
+        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar, clock=clock)
         self.addAsyncCleanup(desktop.close)
 
         def publish(revision):
             desktop.publish_capabilities({**avatar.capabilities(revision), "observations": [], "games": []})
 
         publish(1)
-        self.assertEqual(avatar.capabilities(1)["avatar"]["hotkeys"], ["hotkey-demo-spark"])
+        capabilities = avatar.capabilities(1)["avatar"]
+        self.assertEqual([action["name"] for action in capabilities["actions"] if action["name"].startswith("outfit.")],
+                         ["outfit.casual", "outfit.jacket"])
+        self.assertEqual(capabilities["hotkeys"], ["hotkey-demo-spark"])
         await desktop._register()
         await desktop._exchange()
         avatar.set_enabled(True)
@@ -286,8 +323,13 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         await avatar._action_task
         await desktop._exchange()
         receipt = host.receipt(desktop.session, intent["task_id"])
-        self.assertEqual(receipt["status"], "accepted")
+        self.assertEqual(receipt["status"], "completed")
         self.assertEqual(receipt["evidence"]["source"], "vts_hotkey_ack")
+        elapsed += 6
+        self.assertEqual(host.receipt(desktop.session, intent["task_id"]), receipt)
+        desktop.dispatcher.expire()
+        await desktop._exchange()
+        self.assertEqual(host.send_intent(desktop.session, intent), receipt)
         desktop.dispatcher.receive(message("intent", desktop.session, intent))
         self.assertEqual(hotkey_writes, ["hotkey-demo-spark"])
 

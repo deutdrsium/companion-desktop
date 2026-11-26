@@ -142,14 +142,14 @@ class ProceduralAvatar:
             if category == "event":
                 result = await trigger_event(catalog, name, self.output, is_current=current)
             else:
+                if category == "activity":
+                    self._applied_activity = None
                 selections = {"activity": {"activity": name}, "outfit": {"outfit": name},
                               "accessory": {"accessories": frozenset({name})},
                               "expression": {"expressions": frozenset({name})}}
                 result = await apply_state(catalog, ModelSelection(**selections[category]),
                                            self.output, is_current=current)
             if current():
-                if category == "activity" and result.status == "completed":
-                    self._applied_activity = None
                 report(OutputResult(result.status, result.reason_code, result.evidence))
         finally:
             self._action_id = self._action_task = None
@@ -224,6 +224,7 @@ class ProceduralAvatar:
 
         try:
             if observed is not None and current():
+                self._applied_activity = None
                 result = await apply_state(self.output.catalog, ModelSelection(activity=name),
                                            self.output, is_current=current)
                 if result.status == "completed" and current():

@@ -258,5 +258,7 @@ class SessionState(QObject):
 
     def _speech_never_started(self):
         if self.presence == "thinking":
+            turn_id = self.turn_id
             self.speech_start_timed_out.emit()
-            self.speech_finished()
+            if self.turn_id == turn_id:
+                self.speech_finished()
