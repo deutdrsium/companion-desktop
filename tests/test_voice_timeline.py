@@ -6,7 +6,6 @@ import io
 import time
 import wave
 
-import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 import pytest
 
@@ -253,6 +252,71 @@ async def wait_for(condition):
     async with asyncio.timeout(2):
         while not condition():
             await asyncio.sleep(0.01)
+
+
+def test_device_idle_requires_confirmed_grant_and_survives_host_disconnect(device_controller):
+    controller = device_controller
+    backend = controller.backend
+    session = backend.session
+    rig = Rig()
+    backend.avatar = rig.avatar
+    backend.avatar.set_enabled(False)
+    session.dispatcher.outputs["avatar"] = backend.avatar
+    session.set_permissions({"avatar", "speak"})
+
+    async def exercise():
+        host = SessionHost()
+        binding = Binding("device-demo", "binding-demo", frozenset())
+        failure = None
+
+        async def transport(operation, payload):
+            if failure == "connection_lost":
+                raise ConnectionError(failure)
+            if failure == "unauthorized":
+                raise ProtocolError(failure)
+            return host.handle(binding, operation, payload)
+
+        session._transport = transport
+        session._poll_interval = 0.01
+        backend._publish()
+        session.start()
+        await wait_for(lambda: controller.state.connection == "connected")
+        assert not controller.state.can_send
+        assert controller.state.status_text() == "设备未获对话授权"
+        frame_task = asyncio.create_task(backend._frames())
+        try:
+            await asyncio.sleep(0.05)
+            assert not rig.vts.frames
+            binding = Binding("device-demo", "binding-demo", frozenset({"avatar", "speak"}))
+            backend.reconnect_session()
+            await wait_for(lambda: bool(rig.vts.frames))
+            assert controller.state.can_send
+            binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+            await wait_for(lambda: controller.state.permissions == {"speak"})
+            newest = len(rig.vts.frames)
+            await asyncio.sleep(0.05)
+            assert len(rig.vts.frames) == newest
+            binding = Binding("device-demo", "binding-demo", frozenset({"avatar", "speak"}))
+            backend.reconnect_session()
+            await wait_for(lambda: len(rig.vts.frames) > newest)
+            failure = "connection_lost"
+            await wait_for(lambda: session.connection["state"] == "reconnecting")
+            assert not session.dispatcher.permissions
+            newest = len(rig.vts.frames)
+            await wait_for(lambda: len(rig.vts.frames) > newest)
+            failure = "unauthorized"
+            backend.reconnect_session()
+            await wait_for(lambda: controller.state.connection_closed)
+            newest = len(rig.vts.frames)
+            await asyncio.sleep(0.05)
+            assert len(rig.vts.frames) == newest
+            assert controller.state.status_text() == "设备绑定或连接凭据未获授权"
+            assert "正在重连" not in controller.panel.banner.detail.text()
+        finally:
+            frame_task.cancel()
+            await asyncio.gather(frame_task, return_exceptions=True)
+
+    backend.loop.run_until_complete(exercise())
 
 
 @pytest.mark.parametrize("lose_ack", [True, False])

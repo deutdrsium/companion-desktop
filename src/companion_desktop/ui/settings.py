@@ -593,12 +593,18 @@ class SettingsWindow(QWidget):
         self.version.setText(f"{self.version_text} · {conn}")
         if state.connection == "offline":
             retry = state.retry_in_s
-            text = f"连接断开，正在重连（第 {state.attempt} 次" + (f"，{retry} 秒后）" if retry is not None else "）")
+            text = state.status_text()
+            if not state.connection_closed and state.attempt:
+                text += f"（第 {state.attempt} 次" + (f"，{retry} 秒后）" if retry is not None else "）")
             color = theme.ERROR_FG
         elif state.connection == "connecting":
             text, color = "正在连接服务器…", STATE["connecting"]["fg"]
         else:
             text, color = "已连接。", "accent"
+            if state.permissions is not None:
+                speak = "已授权" if "speak" in state.permissions else "未授权"
+                avatar = "已授权" if "avatar" in state.permissions else "未授权"
+                text += f" 对话{speak}，模型控制{avatar}。"
         self.conn_status.setText(text)
         set_label_color(self.conn_status, color)
 

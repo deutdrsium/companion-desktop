@@ -147,6 +147,19 @@ def test_speech_failure_keeps_text_and_offers_replay(ctl):
     assert c.backend.speech[-1][1] == 0
 
 
+def test_speech_start_timeout_releases_synthesis_and_ignores_late_audio(ctl):
+    c = ctl
+    c.send("Example message")
+    c.backend.chat_done.emit(c.backend.last_turn(), "Example reply.")
+    generation = c.reading_gen
+    c.state._grace.timeout.emit()
+    assert c.state.presence == "idle"
+    assert replies(c)[-1].mode == "speech_failed"
+    assert c.reading_gen is None and c.backend.generation > generation
+    c.backend.audio.emit(generation, "demo-audio", 0, "Example reply.", b"RIFF", True)
+    assert not c.player.queue
+
+
 def test_typing_while_speaking_stops_her(ctl):
     c = ctl
     c.send("hi")

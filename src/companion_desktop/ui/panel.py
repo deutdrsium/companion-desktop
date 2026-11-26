@@ -155,6 +155,8 @@ class Panel(QWidget):
             c.set_hint("连上以后可以发送，你写的内容会留着")
         elif s == "connecting":
             c.set_hint("连上以后可以发送")
+        elif not state.can_send:
+            c.set_hint("设备未获对话授权，你写的内容会留着")
         elif state.presence == "thinking":
             c.set_hint("比平时慢一些 · 网络或模型在排队，按 Esc 可以取消" if state.slow
                        else f"{name}在想 · 按 Esc 或点 ■ 可以取消")
@@ -168,10 +170,14 @@ class Panel(QWidget):
             retry = state.retry_in_s
             when = f"（第 {state.attempt} 次，{retry} 秒后）" if retry else (
                 f"（第 {state.attempt} 次）" if state.attempt else "")
-            self.banner.show_message("offline", "和服务器的连接断了",
-                                     f"正在重连{when}。{name}的待机动作不受影响。", "立即重连")
+            if state.connection_closed:
+                self.banner.show_message("offline", "桌面会话已关闭", state.status_text(), "立即重连")
+            else:
+                self.banner.show_message("offline", "和服务器的连接断了", f"正在重连{when}。", "立即重连")
             self.banner_wrap.show()
-            if not self.countdown.isActive():
+            if state.connection_closed:
+                self.countdown.stop()
+            elif not self.countdown.isActive():
                 self.countdown.start()
         else:
             self.countdown.stop()

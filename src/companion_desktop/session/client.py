@@ -39,7 +39,8 @@ class _SessionEvents:
         self._listeners = []
         self._connection = {"state": "closed", "attempt": 0, "next_retry_ms": None,
                             "generation": None, "reason": None}
-        self._capabilities = {"tts": False, "mouth": False, "subtitle": False, "observe_scopes": []}
+        self._capabilities = {"tts": False, "mouth": False, "subtitle": False, "observe_scopes": [],
+                              "permissions": None, "published_revision": None}
 
     @property
     def connection(self):
@@ -74,9 +75,11 @@ class _SessionEvents:
                             "generation": generation, "reason": reason}
         self._emit("connection", **self._connection)
 
-    def _set_capabilities(self, *, tts=False, mouth=False, subtitle=False, observe_scopes=()):
+    def _set_capabilities(self, *, tts=False, mouth=False, subtitle=False, observe_scopes=(),
+                          permissions=None, published_revision=None):
         capabilities = {"tts": tts, "mouth": mouth, "subtitle": subtitle,
-                        "observe_scopes": list(observe_scopes)}
+                        "observe_scopes": list(observe_scopes), "permissions": permissions,
+                        "published_revision": published_revision}
         if capabilities != self._capabilities:
             self._capabilities = capabilities
             self._emit("capabilities", **self._capabilities)
@@ -220,6 +223,12 @@ class DesktopSession(_SessionEvents):
             self._closing = False
             self._runner = asyncio.create_task(self._run())
         return self._runner
+
+    def reconnect(self):
+        if self.session is not None:
+            self._reconfigure = True
+        self._wake.set()
+        self.start()
 
     async def close(self):
         if self._runner is not None:
@@ -393,7 +402,8 @@ class DesktopSession(_SessionEvents):
         self._set_capabilities(tts=caps.get("tts", False) and "speak" in self._grant,
                                mouth=caps.get("mouth", False) and "avatar" in self._grant,
                                subtitle=caps.get("subtitle", False),
-                               observe_scopes=caps["observations"] if "observe" in self._grant else ())
+                               observe_scopes=caps["observations"] if "observe" in self._grant else (),
+                               permissions=sorted(self._grant), published_revision=self._published_revision)
         if self._connection["state"] != "connected":
             self._set_connection("connected", attempt=attempt, generation=ref["generation"])
         if "speak" not in self._grant:

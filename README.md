@@ -27,6 +27,13 @@ copy config\client.example.json config\client.json   # then fill in; config/*.js
 The connection key is read from the OS credential store (`account.keyring_service` /
 `account.username`). Options: `--config PATH`, `--no-helpers`, `--steam-autostart`.
 
+With `server.device_session` enabled, the Connection page shows the host grants for
+chat and avatar control. The host owns the device binding and its permissions. Use
+Reconnect after a host-side grant change to register a fresh session.
+
+The wheel includes `astrbot_plugin_desktop_access.session` and the shared session
+contract for host integrations that install the wheel into their runtime.
+
 Tests run offscreen: `QT_QPA_PLATFORM=offscreen python -m pytest`.
 `tools/render_states.py OUT_DIR` renders every panel state with placeholder text.
 
