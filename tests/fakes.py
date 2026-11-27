@@ -114,3 +114,89 @@ class FakeSubtitles:
 
     def set_style(self, *a):
         self.style = a
+
+
+class FakeQPlayer:
+    def __init__(self, media):
+        self.media, self.calls, self.output = media, [], None
+
+    def play(self):
+        self.calls.append("play")
+        self.media.status("playing")
+
+    def pause(self):
+        self.calls.append("pause")
+        self.media.status("paused")
+
+    def stop(self):
+        self.calls.append("stop")
+
+    def setVideoOutput(self, widget):
+        self.output = widget
+
+
+class FakeMedia(QObject):
+    state_changed = pyqtSignal(object)
+    reaction = pyqtSignal(object)
+    reaction_cancelled = pyqtSignal(str)
+    tier = pyqtSignal(object)
+    item_changed = pyqtSignal(object)
+    sources_changed = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, start_ok=True):
+        super().__init__()
+        self.active, self.start_ok = False, start_ok
+        self.item, self.current_line = None, None
+        self.loaded = self.selected = self.timed = None
+        self.started, self.refreshed = [], 0
+        self.system = [{"id": "s1", "source": "system_media", "label": "Spotify.exe"}]
+        self.local_player = type("LP", (), {})()
+        self.local_player.player = FakeQPlayer(self)
+
+    @property
+    def sources(self):
+        return ({"id": "local_player", "source": "local_player", "label": "本地播放器"}, *self.system)
+
+    @property
+    def current_item(self):
+        return dict(self.item) if self.item else None
+
+    def refresh_sources(self):
+        self.refreshed += 1
+        self.sources_changed.emit(self.sources)
+
+    def load_local(self, path, timed_text=None):
+        if path.endswith(".bad"):
+            raise ValueError("local_file_required")
+        self.loaded = (path, timed_text)
+
+    def select_system(self, source_id):
+        self.selected = source_id
+
+    def set_timed_text(self, path=None):
+        self.timed = path
+
+    def start(self, source, kind):
+        if not self.start_ok:
+            self.error.emit("no_media")
+            return False
+        self.active, self.kind, self.source = True, kind, source
+        self.started.append((source, kind))
+        return True
+
+    def stop(self):
+        if self.active:
+            self.active, self.item = False, None
+            self.state_changed.emit({"type": "shared_media.state", "status": "idle", "media_id": None, "seq": 1})
+            self.item_changed.emit(None)
+
+    # test helpers
+    def push(self, **item):
+        self.item = {"kind": self.kind, "source": self.source, "status": "playing", "title": "晚风",
+                     "position_ms": 30_000, "duration_ms": 180_000, **item}
+        self.item_changed.emit(self.current_item)
+
+    def status(self, status):
+        if self.item:
+            self.push(**{**self.item, "status": status})

@@ -12,6 +12,7 @@ class Tray(QObject):
     periodic_toggled = pyqtSignal(bool)
     autonomous_toggled = pyqtSignal(bool)
     look_now = pyqtSignal()
+    together = pyqtSignal()
     copy_subtitle_url = pyqtSignal()
     pin_toggled = pyqtSignal(bool)
     open_settings = pyqtSignal()
@@ -33,6 +34,7 @@ class Tray(QObject):
         self.a_autonomous.setEnabled(False)
         self.a_now = self._act("现在看一下当前窗口", self.look_now)
         self.menu.addSeparator()
+        self.a_together = self._act("一起听 / 一起看…", self.together)
         self._act("复制 VTS 字幕地址", self.copy_subtitle_url)
         self.a_pin = self._act("窗口置顶", None, checkable=True)
         self.a_pin.toggled.connect(self.pin_toggled)
@@ -63,6 +65,9 @@ class Tray(QObject):
                 action.blockSignals(True)
                 action.setChecked(value)
                 action.blockSignals(False)
+
+    def set_together(self, active, verb="一起听"):
+        self.a_together.setText(f"正在{verb} · 显示面板" if active else "一起听 / 一起看…")
 
     def update_state(self, state):
         s = state.state

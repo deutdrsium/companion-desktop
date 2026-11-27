@@ -7,7 +7,7 @@ from PyQt5.QtGui import QKeyEvent
 
 from companion_desktop.ui.composer import Composer
 from companion_desktop.ui.paint import Character, StateAvatar, Toggle, tray_icon
-from companion_desktop.ui.settings import SettingsWindow
+from companion_desktop.ui.settings import PAGES, SettingsWindow
 from companion_desktop.ui.splash import LaunchCard
 from companion_desktop.ui.theme import STATE
 
@@ -117,7 +117,7 @@ def test_settings_and_launch_card_render(qapp, prefs):
     from companion_desktop.ui.session_state import SessionState
     s = SessionState()
     w = SettingsWindow(Character("测试"), prefs, s, "http://127.0.0.1:18676/" + "a" * 48 + "/")
-    for i in range(6):
+    for i in range(len(PAGES)):
         w.show_page(i)
         _render(w)
     from PyQt5.QtWidgets import QLineEdit

@@ -38,7 +38,11 @@ from companion_desktop.ui.observe import ConsentDialog  # noqa: E402
 from companion_desktop.ui.paint import Animated, Character  # noqa: E402
 from companion_desktop.ui.settings import Prefs, SettingsWindow  # noqa: E402
 from companion_desktop.ui.splash import LaunchCard  # noqa: E402
-from fakes import FakeBackend, FakePlayer, FakeSubtitles  # noqa: E402
+from companion_desktop.ui.panel import Panel  # noqa: E402
+from companion_desktop.ui.session_state import SessionState  # noqa: E402
+from companion_desktop.ui.together import Together  # noqa: E402
+from companion_desktop.ui.tray import Tray  # noqa: E402
+from fakes import FakeBackend, FakeMedia, FakePlayer, FakeSubtitles  # noqa: E402
 
 Animated.reduced = True
 app.setStyleSheet(theme.qss())
@@ -81,6 +85,58 @@ def speaking(c, ask="你看我新养的这条鱼，它一直盯着我。",
     c.player.play_next()
     c.player.finish()
     c.player.play_next()
+
+
+def together(prefs, unavailable=None, size=(440, 760), media=None):
+    state = SessionState()
+    state.set_connection("connected")
+    panel = Panel(CHAR, "桌面陪伴", state)
+    panel.resize(*size)
+    panel.show()
+    panel.chat.load_history(HISTORY)
+    media = media or FakeMedia()
+    names = iter(["D:/音乐/晚风.mp3", "D:/音乐/晚风.lrc"])
+    t = Together(None if unavailable else media, panel, prefs, state, CHAR.name, unavailable,
+                 video_window=None, pick=lambda _t, _f, done: done(next(names, None)))
+    return t, panel, media
+
+
+def render_together(prefs):
+    t, panel, media = together(prefs)
+    t.open()
+    t.picker.choose.click()
+    t.picker.choose_text.click()
+    save(panel, "20-together-picker-local")
+    t.picker.source.buttons[1].click()
+    media.system.append({"id": "s2", "source": "system_media", "label": "Microsoft.ZuneMusic_8wekyb3d8bbwe!App"})
+    t.picker.set_sources(media.sources)
+    t.picker._pick_system("s1")
+    save(panel, "21-together-picker-system")
+    t, panel, _ = together(prefs, "一起听/看还没开启：本机设置里的 shared_media_enabled 是关闭的。打开后重启面板。")
+    t.open()
+    save(panel, "22-together-flag-off")
+    t, panel, _ = together(prefs)
+    t.state.set_permissions({"avatar"})
+    t.open()
+    save(panel, "23-together-no-speak")
+
+    t, panel, media = together(prefs)
+    t.begin({"kind": "music", "source": "local_player", "path": "D:/音乐/晚风.mp3", "system_id": None})
+    media.current_line = "晚风吹过山岗，把灯一盏盏点亮"
+    media.push(title="晚风", position_ms=83_000, duration_ms=215_000)
+    media.reaction.emit({"reaction_id": "r1", "text": "这段前奏好温柔。", "segments": []})
+    save(panel, "24-together-music")
+    t, panel, media = together(prefs)
+    t.begin({"kind": "music", "source": "system_media", "path": None, "system_id": "s1"})
+    media.push(title="晚风", artist="示例乐队", position_ms=None, duration_ms=None, status="paused")
+    save(panel, "25-together-system-unknown-progress")
+    t, panel, media = together(prefs, size=(360, 540))
+    t.begin({"kind": "movie", "source": "local_player", "path": "D:/片/夜航.mp4", "system_id": None})
+    media.push(title="夜航", position_ms=3_905_000, duration_ms=5_400_000)
+    media.reaction.emit({"reaction_id": "r2", "text": "这里好安静。", "segments": []})
+    save(panel, "26-together-movie-minimal")
+    media.reaction_cancelled.emit("r2")
+    save(panel, "27-together-movie-reaction-cancelled")
 
 
 def main():
@@ -157,6 +213,14 @@ def main():
     save(card, "launch-connecting")
     card.fail(1, "暂时连不上服务器", "10 秒内没能建立加密连接。可能是网络不通，或服务器正在重启。")
     save(card, "launch-failed")
+    w = SettingsWindow(CHAR, c.prefs, c.state, FakeSubtitles.item_url)
+    w.show()
+    w.show_page(5)
+    save(w, "settings-together")
+    render_together(c.prefs)
+    tray = Tray(CHAR, "桌面陪伴", c.state)
+    tray.menu.adjustSize()
+    save(tray.menu, "tray-menu")
     m = c.panel.more_menu()
     m.adjustSize()
     save(m, "more-menu")

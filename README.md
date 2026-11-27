@@ -60,6 +60,12 @@ controls continue to belong to the selected player.
   `set_owner_speaking(active)` accept local cues. The existing opt-in headset
   input drives owner-speech cues during a shared movie.
 
+In the panel, the ♪ header button, the "更多" menu and the tray menu open 一起听 / 一起看
+(`ui/together.py`). It explains why it is unavailable when the flag, the device session or the
+`speak` grant is missing. A now-playing card sits above the conversation, and it folds to one
+row for films. A local film plays in its own window. Reactions appear as small bubbles, and
+cancelled ones are removed. Settings → 一起听看 turns the entry off and sets the default source.
+
 Shared snapshots contain a sanitized title, media kind, source, playback status and
 timing. Local audio contributes numeric RMS levels. Only Windows music sessions can
 include an artist. A comment may include one current timed-text line with links,
