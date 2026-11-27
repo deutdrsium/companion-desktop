@@ -7,6 +7,7 @@ The video of a local film plays in its own window; nothing here is drawn over it
 
 from pathlib import Path
 
+from PyQt5 import sip
 from PyQt5.QtCore import QObject, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFontMetrics, QPainter
 from PyQt5.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
@@ -250,6 +251,7 @@ class TogetherPicker(Layer):
         super().__init__(parent)
         self.anchor = anchor
         self.pick = pick or self._pick
+        self.dialog = None
         self.path = self.timed_text = self.system_id = None
         self.sources = []
         card = Card(parent=self)
@@ -400,12 +402,26 @@ class TogetherPicker(Layer):
             self.place()
 
     # ------------------------------------------------------------ choices
-    def _pick(self, title, filter_):
-        path, _ = QFileDialog.getOpenFileName(self.window(), title, "", filter_)
-        return path or None
+    def _pick(self, title, filter_, done):
+        """Window-modal but non-blocking: the event loop and the session's sync timers keep running."""
+        if self.dialog is not None:
+            self.dialog.close()
+        dialog = QFileDialog(self.window(), title, "", filter_)
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.fileSelected.connect(lambda path: done(path or None))
+        dialog.destroyed.connect(lambda _=None: self._dialog_gone(dialog))
+        self.dialog = dialog
+        dialog.open()
+
+    def _dialog_gone(self, dialog):
+        if self.dialog is dialog:
+            self.dialog = None
 
     def _choose(self):
-        path = self.pick("选择要一起听/看的文件", MEDIA_FILTER)
+        self.pick("选择要一起听/看的文件", MEDIA_FILTER, self._chosen)
+
+    def _chosen(self, path):
         if path:
             self.path = path
             self.file_label.set_text(Path(path).name)
@@ -413,7 +429,9 @@ class TogetherPicker(Layer):
             self._render()
 
     def _choose_text(self):
-        path = self.pick("选择字幕或歌词", TEXT_FILTER)
+        self.pick("选择字幕或歌词", TEXT_FILTER, self._chosen_text)
+
+    def _chosen_text(self, path):
         if path:
             self.timed_text = path
             self.text_label.set_text(Path(path).name)
@@ -483,7 +501,7 @@ class Together(QObject):
 
     def __init__(self, media, panel, prefs, state, name="她", unavailable=None, presented=None,
                  video_window=VideoWindow, pick=None):
-        super().__init__(panel)
+        super().__init__()   # not a child of the panel: it outlives it to clean up
         self.media, self.panel, self.prefs, self.state, self.name = media, panel, prefs, state, name
         self.unavailable = unavailable
         self.presented = presented or (lambda _rid: True)
@@ -491,6 +509,7 @@ class Together(QObject):
         self.video = None
         self.kind = self.source = None
         self.reactions = {}           # reaction_id -> bubble
+        self.cancelled = []           # recently cancelled reaction ids, newest last
         self.active = False
         self.button = panel.header.together
         self.picker = TogetherPicker(panel, name, anchor=self.button, pick=pick)
@@ -503,16 +522,17 @@ class Together(QObject):
         self.card.play_pause.connect(self._play_pause)
         self.card.stop.connect(self._halt)
         self.card.end.connect(self.end)
-        prefs.changed.connect(self._pref)
-        state.changed.connect(lambda _s: self._reason())
+        # (owner, signal name, slot): kept so they can be cut when the panel goes
+        self.links = [(prefs, "changed", self._pref), (state, "changed", lambda _s: self._reason())]
         if media is not None:
-            media.state_changed.connect(lambda _s: self._sync())
-            media.item_changed.connect(self._item)
-            media.sources_changed.connect(self.picker.set_sources)
-            media.reaction.connect(self._reaction)
-            media.reaction_cancelled.connect(self._cancelled)
-            media.error.connect(self._error)
+            self.links += [(media, "state_changed", lambda _s: self._sync()), (media, "item_changed", self._item),
+                           (media, "sources_changed", lambda s: self.picker.set_sources(s)),
+                           (media, "reaction", self._reaction), (media, "reaction_cancelled", self.cancel_reaction),
+                           (media, "error", self._error)]
             self.picker.set_sources(media.sources)
+        for owner, name, slot in self.links:
+            getattr(owner, name).connect(slot)
+        panel.destroyed.connect(self._panel_gone)
         self.picker.set_source(prefs.get("together_source"))
         self._render()
 
@@ -605,11 +625,33 @@ class Together(QObject):
 
     def _close_video(self, from_video=False):
         video, self.video = self.video, None
-        if video is not None:
+        if video is not None and not sip.isdeleted(video):
             video.on_close = None
             if not from_video:
                 video.close()
             video.deleteLater()
+
+    def _panel_gone(self, *_):
+        """The panel (with the card, picker and bubbles) is gone: nothing may call back into it."""
+        for owner, name, slot in self.links:
+            if not sip.isdeleted(owner):   # at interpreter exit the owner may already be gone
+                try:
+                    getattr(owner, name).disconnect(slot)
+                except TypeError:
+                    pass
+        self.links = []
+        self.reactions.clear()
+        m, self.panel = self.media, None
+        if m is not None and sip.isdeleted(m):
+            m = None
+        if m is not None and self.active:
+            m.stop()
+            if self.source == "local_player":
+                m.local_player.player.stop()
+        if m is not None and self.video is not None:
+            m.local_player.player.setVideoOutput(None)
+        self._close_video()
+        self.active = False
 
     def _halt(self):
         if self.media is not None and self.source == "local_player":
@@ -627,6 +669,8 @@ class Together(QObject):
 
     # ------------------------------------------------------------ media events
     def _sync(self):
+        if self.panel is None:
+            return
         active = self.media is not None and self.media.active
         if active != self.active:
             self.active = active
@@ -657,13 +701,20 @@ class Together(QObject):
 
     def _reaction(self, event):
         rid = event.get("reaction_id")
-        if not self.active or not rid or not self.presented(rid):
+        if (not self.active or not rid or rid in self.cancelled or rid in self.reactions
+                or not self.presented(rid)):
             return
         self.reactions[rid] = self.panel.chat.add_reaction(event.get("text", ""), self.kind or "music")
 
-    def _cancelled(self, reaction_id):
+    def cancel_reaction(self, reaction_id):
+        """Idempotent; shared_media and the controller both call it, whichever notices first."""
+        if not reaction_id:
+            return
+        if reaction_id not in self.cancelled:
+            self.cancelled.append(reaction_id)
+            del self.cancelled[:-64]
         bubble = self.reactions.pop(reaction_id, None)
-        if bubble is not None:
+        if bubble is not None and self.panel is not None:
             self.panel.chat.remove_item(bubble)
 
     def _error(self, reason):

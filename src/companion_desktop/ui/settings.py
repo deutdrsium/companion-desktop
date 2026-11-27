@@ -14,7 +14,8 @@ from .theme import C, STATE
 from .widgets import button, hline, label, set_label_color
 
 PAGES = ("外观", "声音", "字幕", "回复节奏", "观察", "一起听看", "连接")
-TOGETHER_PRIVACY = "只有标题、播放进度和当前这一句字幕或歌词会离开这台电脑；画面、声音和文件本身都不会。"
+TOGETHER_PRIVACY = ("离开这台电脑的只有：标题、音乐还是电影、播放来源、播放或暂停、进度、当前这一句字幕或歌词（已去掉网址）、"
+                    "声音大小的数值；系统里正在放的音乐还会带上歌手名。画面、声音和文件本身都不会。")
 
 # Reply-rhythm presets: (min wait, max wait, total cap) in ms.
 RHYTHM_PRESETS = [("快", 300, 1000, 3000), ("适中", 600, 1500, 4000), ("从容", 1500, 3000, 8000)]

@@ -97,7 +97,7 @@ def together(prefs, unavailable=None, size=(440, 760), media=None):
     media = media or FakeMedia()
     names = iter(["D:/音乐/晚风.mp3", "D:/音乐/晚风.lrc"])
     t = Together(None if unavailable else media, panel, prefs, state, CHAR.name, unavailable,
-                 video_window=None, pick=lambda *_: next(names, None))
+                 video_window=None, pick=lambda _t, _f, done: done(next(names, None)))
     return t, panel, media
 
 

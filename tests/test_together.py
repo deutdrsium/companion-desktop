@@ -32,7 +32,7 @@ def make(prefs, media=None, unavailable=None, presented=None, connected=True, pe
     panel.resize(440, 760)
     picks = []
     t = Together(media, panel, prefs, state, "测试", unavailable, presented, video_window=FakeVideo,
-                 pick=lambda _title, filter_: picks.pop(0) if picks else None)
+                 pick=lambda _title, _filter, done: done(picks.pop(0) if picks else None))
     return t, panel, picks
 
 
@@ -315,3 +315,109 @@ def test_binds_to_real_shared_media(qapp, prefs, monkeypatch, tmp_path):
         cleanup(panel)
 
     asyncio.run(run())
+
+
+def test_deleting_panel_mid_film_stops_player_and_disconnects(qapp, prefs):
+    from PyQt5 import sip
+    FakeVideo.made.clear()
+    media = FakeMedia()
+    t, panel, _ = make(prefs, media)
+    panel.show()
+    assert t.begin({"kind": "movie", "source": "local_player", "path": "C:/片/夜航.mp4", "system_id": None})
+    media.push(title="夜航")
+    video = FakeVideo.made[0]
+    panel.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert sip.isdeleted(panel)
+    assert media.local_player.player.calls[-1] == "stop" and not media.active
+    assert media.local_player.player.output is None and t.video is None
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert sip.isdeleted(video)
+    for signal in (media.state_changed, media.item_changed, media.sources_changed, media.reaction,
+                   media.reaction_cancelled, media.error):
+        assert media.receivers(signal) == 0
+    calls = []
+    t._sync = t._item = t._reaction = lambda *a: calls.append(a)
+    media.push(title="later")
+    media.reaction.emit({"reaction_id": "late", "text": "x", "segments": []})
+    media.error.emit("connection_lost")
+    assert calls == []
+
+
+def _together_with_bubble(prefs):
+    media = FakeMedia()
+    t, panel, _ = make(prefs, media)
+    panel.show()
+    t.begin({"kind": "music", "source": "local_player", "path": "C:/a.mp3", "system_id": None})
+    media.reaction.emit({"reaction_id": "r1", "text": "好听。", "segments": []})
+    bubble = t.reactions["r1"]
+    assert bubble in panel.chat.items
+    return t, panel, media, bubble
+
+
+def test_cancel_from_shared_media_first_then_controller(qapp, prefs):
+    t, panel, media, bubble = _together_with_bubble(prefs)
+    media.reaction_cancelled.emit("r1")
+    assert bubble not in panel.chat.items
+    t.cancel_reaction("r1")                      # the controller's later notice is a no-op
+    assert bubble not in panel.chat.items and t.cancelled == ["r1"]
+    media.reaction.emit({"reaction_id": "r1", "text": "好听。", "segments": []})
+    assert not any(isinstance(i, ReactionBubble) for i in panel.chat.items)
+    cleanup(panel)
+
+
+def test_cancel_from_controller_first_without_shared_media_signal(qapp, prefs):
+    t, panel, media, bubble = _together_with_bubble(prefs)
+    t.cancel_reaction("r1")                      # presentation tick saw the lyric boundary first
+    assert bubble not in panel.chat.items
+    media.reaction_cancelled.emit("r1")
+    assert t.cancelled == ["r1"]
+    cleanup(panel)
+
+
+def test_cancel_before_show_ignores_late_reaction(qapp, prefs):
+    media = FakeMedia()
+    t, panel, _ = make(prefs, media)
+    t.begin({"kind": "music", "source": "local_player", "path": "C:/a.mp3", "system_id": None})
+    t.cancel_reaction("r9")
+    media.reaction.emit({"reaction_id": "r9", "text": "迟到的", "segments": []})
+    assert not any(isinstance(i, ReactionBubble) for i in panel.chat.items)
+    cleanup(panel)
+
+
+def test_controller_cancel_path_reaches_the_panel(ctl):
+    ctl._cancel_media_reaction("r1")
+    assert "r1" in ctl.together.cancelled
+
+
+def test_file_dialog_does_not_block_timers(qapp, prefs):
+    from PyQt5.QtCore import QEventLoop, QTimer
+    media = FakeMedia()
+    state = SessionState()
+    state.set_connection("connected")
+    panel = Panel(Character("测试"), "测试面板", state)
+    t = Together(media, panel, prefs, state, "测试", video_window=FakeVideo)   # real file dialog
+    panel.show()
+    t.open()
+    ticks = []
+    timer = QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.append(1))
+    timer.start()
+    t.picker.choose.click()                      # returns at once; the dialog stays open
+    dialog = t.picker.dialog
+    assert dialog is not None and dialog.isVisible()
+    loop = QEventLoop()
+    QTimer.singleShot(200, loop.quit)
+    loop.exec_()
+    assert len(ticks) >= 5 and dialog.isVisible()
+    dialog.fileSelected.emit("C:/音乐/晚风.mp3")
+    assert t.picker.path == "C:/音乐/晚风.mp3" and t.picker.go.isEnabled()
+    dialog.close()
+    timer.stop()
+    cleanup(panel)
+
+
+def test_privacy_line_lists_what_is_sent():
+    for word in ("标题", "音乐还是电影", "播放来源", "播放或暂停", "进度", "已去掉网址", "声音大小的数值", "歌手名"):
+        assert word in PRIVACY

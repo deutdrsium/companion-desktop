@@ -487,6 +487,7 @@ class Controller(QObject):
             self._start_text(self._media_segments)
 
     def _cancel_media_reaction(self, reaction_id):
+        self.together.cancel_reaction(reaction_id)   # either path may see the cancellation first
         if reaction_id == self._media_reaction_id:
             self.stop_speech()
             self.state.interrupted()
