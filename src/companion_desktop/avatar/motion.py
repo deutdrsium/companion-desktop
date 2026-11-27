@@ -101,7 +101,8 @@ class Motion:
         self._reflex = (self.time, 1.4, (0.0, 0.06), 0.30, 0.45)
 
     def blink(self):
-        self._blink_start = self.time
+        if self._blink_start is not None:
+            self._blink_start = self.time
 
     def stop_mouth(self):
         self.mouth_target = 0.0
@@ -120,27 +121,34 @@ class Motion:
         self._next_click = self.time
 
     def advance(self, elapsed, now, gestures):
-        if elapsed >= PAUSE_GAP:
-            self._remaining = 0.0
-            self._reflex = self._last_pointer = self._follow = None
-            self.reply_smile_until = 0.0
-            self._lid = 1.0
-            self._schedule_blink()
-            self.stop_mouth()
-            return self._frame()
-
         reading, fatigue, happiness = (0.0, 0.0, 0.0)
+        sleeping = False
         if self.role_state is not None:
             body, deadline = self.role_state
             if now >= deadline:
                 self.role_state = None
             else:
                 reading = float(body["activity"] in {"read", "reading", "阅读", "读书"})
+                sleeping = body["activity"] in {"sleep", "sleeping", "睡觉", "睡眠"}
                 energy = body["energy"]
                 fatigue = max(body["sleepiness"] or 0.0, 0.0 if energy is None else 1 - energy)
-                if body["emotion"] in {"sleepy", "困倦"}:
+                if body["emotion"] in {"sleepy", "drowsy", "困倦"}:
                     fatigue = max(fatigue, 0.75)
                 happiness = float(body["emotion"] in {"happy", "joy", "开心"})
+
+        if sleeping:
+            self._blink_start = None
+            self._lid = 0.0
+        elif self._blink_start is None or elapsed >= PAUSE_GAP:
+            self._lid = 1.0
+            self._schedule_blink()
+
+        if elapsed >= PAUSE_GAP:
+            self._remaining = 0.0
+            self._reflex = self._last_pointer = self._follow = None
+            self.reply_smile_until = 0.0
+            self.stop_mouth()
+            return self._frame()
 
         self._remaining += elapsed
         # Clock samples accumulate fractional steps. A tiny tolerance keeps
@@ -168,14 +176,15 @@ class Motion:
         if t >= self._next_shift:
             self._weight_shift = self._random.uniform(-0.9, 0.9)
             self._next_shift = t + self._delay(25.0, 30.0)
-        blink_age = t - self._blink_start
-        if blink_age >= BLINK_DURATION:
-            self._schedule_blink()
-        if 0 <= blink_age < BLINK_DURATION:
-            self._lid = (1 - ease(blink_age / BLINK_CLOSE) if blink_age < BLINK_CLOSE
-                         else ease((blink_age - BLINK_CLOSE - BLINK_HOLD) / BLINK_OPEN))
-        else:
-            self._lid = 1.0
+        if self._blink_start is not None:
+            blink_age = t - self._blink_start
+            if blink_age >= BLINK_DURATION:
+                self._schedule_blink()
+            if 0 <= blink_age < BLINK_DURATION:
+                self._lid = (1 - ease(blink_age / BLINK_CLOSE) if blink_age < BLINK_CLOSE
+                             else ease((blink_age - BLINK_CLOSE - BLINK_HOLD) / BLINK_OPEN))
+            else:
+                self._lid = 1.0
 
         sway = (1 + 0.35 * happiness) * (1 - 0.34 * fatigue)
         targets = {
