@@ -19,7 +19,7 @@ from ..ui.session_state import SessionState
 from ..ui.settings import SettingsWindow
 from .audio import PcmClip
 from .protocol import desktop_locked, sentences, visible_text, vts_running
-from .timeline import CueTrack
+from .timeline import CueTrack, PlaybackLevel
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,8 @@ class Controller(QObject):
         self.reading_gen = None
         self.device = device
         self.avatar = backend.avatar if device else None
+        self.level = PlaybackLevel()   # read by the panel avatar halo and the reply waveform
+        self.panel.header.avatar.source = self.level
         self.barge_in = barge_in
         if barge_in is not None:
             barge_in.speech_started.connect(self.stop)
@@ -464,6 +466,7 @@ class Controller(QObject):
         bubble = self.reading
         total = len(bubble.segments) if bubble is not None else 1
         if bubble is not None:
+            bubble.wave.source = self.level
             bubble.set_current(clip.index)
         self.state.segment_started(clip.index, total, clip.text)
         if self.subtitles is not None:
@@ -474,8 +477,10 @@ class Controller(QObject):
     def _clip_progress(self, clip, position, fraction):
         self.state.segment_progress(fraction)
         if self.device:
+            level = clip.level_at(position)
+            self.level.set(level)
             if self.avatar is not None:
-                self.avatar.mouth_level(clip.level_at(position))
+                self.avatar.mouth_level(level)
             if clip.duration_ms > 0:
                 self._advance_cues(clip.index, clip.text, clip.audio_id, position, clip.duration_ms)
         elif clip.mouth:
