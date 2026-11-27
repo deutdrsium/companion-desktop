@@ -9,7 +9,7 @@ from typing import Callable
 
 from companion_desktop.contracts.wire import now_utc
 from companion_desktop.session.dispatcher import OutputResult
-from .model_actions import ActionResult, ModelSelection, StaleOutputError, apply_state
+from .model_actions import ActionResult, ModelSelection, StaleOutputError, apply_state, trigger_event
 from .motion import FRAME_PERIOD, GESTURE_SECONDS, LAUGH, PAUSE_GAP, Motion, unit
 
 
@@ -53,6 +53,8 @@ class ProceduralAvatar:
         self._turn_deadline = 0.0
         self._wardrobe_report = wardrobe_report
         self._wardrobe = self._wardrobe_task = None
+        self._action_id = self._action_task = None
+        self._activity = self._applied_activity = None
 
     def _supported(self):
         bindings = self.output.bindings
@@ -68,17 +70,18 @@ class ProceduralAvatar:
     def capabilities(self, revision):
         observed = self.output.observed
         actions = [{"name": name, "binding": binding} for name, binding in self._supported().items()]
-        if observed is not None and self._wardrobe_report is not None:
-            catalog = self.output.catalog
-            actions.extend(action for action in catalog.avatar_capabilities(observed)["actions"]
-                           if action["name"].startswith("outfit."))
+        hotkeys = []
+        if observed is not None:
+            available = self.output.catalog.avatar_capabilities(observed)
+            actions.extend(available["actions"])
+            hotkeys = available["hotkeys"]
         return {
             "revision": revision, "model_id": observed.model_id if observed else None,
             "asset_version": observed.asset_version if observed else None,
             "avatar": {
                 "inputs": sorted(binding.input_id for binding in self.output.bindings.values()),
                 "actions": actions,
-                "hotkeys": [],
+                "hotkeys": hotkeys,
             },
             "mouth": "mouth_open" in self.output.bindings,
         }
@@ -86,13 +89,26 @@ class ProceduralAvatar:
     def start(self, intent, *, deadline, is_current, report):
         self._sync_model()
         action = intent["action"]
-        # P3 must align cue-bound motions to playback, not arrival time.
-        if (action not in self._supported() or not self._enabled
+        observed = self.output.observed
+        if (observed is None or not self._enabled
                 or intent.get("utterance_id") is not None or intent.get("segment_id") is not None):
             report(OutputResult("unsupported", "missing_dependency"))
             return
-        if intent["model_id"] != self.output.observed.model_id:
+        if intent["model_id"] != observed.model_id:
             report(OutputResult("rejected", "stale_model"))
+            return
+        if action not in self._supported():
+            category, _, name = action.partition(".")
+            if category not in {"activity", "outfit", "accessory", "expression", "event"} or not name:
+                report(OutputResult("unsupported", "missing_dependency"))
+            elif self._action_task is not None or self._wardrobe_task is not None:
+                report(OutputResult("rejected", "busy"))
+            elif intent["params"]:
+                report(OutputResult("rejected", "invalid_config"))
+            else:
+                self._action_id = intent["task_id"]
+                self._action_task = asyncio.create_task(
+                    self._apply_action(intent["task_id"], category, name, deadline, is_current, report))
             return
         if action in self._gestures:
             report(OutputResult("rejected", "busy"))
@@ -112,6 +128,32 @@ class ProceduralAvatar:
         self._revision += 1
         report(OutputResult("accepted"))
 
+    async def _apply_action(self, task_id, category, name, deadline, is_current, report):
+        observed = self.output.observed
+
+        def current():
+            return (self._action_id == task_id and self._enabled and self.output.observed is observed
+                    and self.clock() < deadline and is_current())
+
+        try:
+            if not current():
+                return
+            catalog = self.output.catalog
+            if category == "event":
+                result = await trigger_event(catalog, name, self.output, is_current=current)
+            else:
+                if category == "activity":
+                    self._applied_activity = None
+                selections = {"activity": {"activity": name}, "outfit": {"outfit": name},
+                              "accessory": {"accessories": frozenset({name})},
+                              "expression": {"expressions": frozenset({name})}}
+                result = await apply_state(catalog, ModelSelection(**selections[category]),
+                                           self.output, is_current=current)
+            if current():
+                report(OutputResult(result.status, result.reason_code, result.evidence))
+        finally:
+            self._action_id = self._action_task = None
+
     def play_cue(self, cue, report):
         self._sync_model()
         observed = self.output.observed
@@ -127,6 +169,9 @@ class ProceduralAvatar:
         self.stop_mouth()
 
     def cancel(self, intent, reason):
+        if self._action_id == intent["task_id"]:
+            self._action_id = None
+            return None
         action = intent["action"]
         gesture = self._gestures.get(action)
         if gesture is None or gesture.task_id != intent["task_id"]:
@@ -145,6 +190,7 @@ class ProceduralAvatar:
         self._stop_gestures(reason)
         self._client_id = self._turn_id = None
         self._wardrobe = None
+        self._action_id = self._activity = self._applied_activity = None
         self.motion.clear_reflexes()
         if reason in {"unauthorized", "permissions_changed"}:
             self.motion.role_state = None
@@ -158,11 +204,35 @@ class ProceduralAvatar:
             self.motion.reset_pose()
 
     def snapshot(self, kind, body, *, deadline):
+        self._sync_model()
         if kind == "role_state":
             self.motion.role_state = (body, deadline)
+            activity = body["activity"]
+            catalog = self.output.catalog
+            self._activity = ((activity, deadline) if catalog is not None and activity in catalog.activities
+                              and activity != self._applied_activity else None)
         elif kind == "wardrobe" and self._wardrobe_report is not None:
-            self._sync_model()
             self._wardrobe = body
+
+    async def _apply_activity(self, activity):
+        name, deadline = activity
+        observed = self.output.observed
+
+        def current():
+            return (self._enabled and self._activity is activity and self.output.observed is observed
+                    and self.clock() < deadline)
+
+        try:
+            if observed is not None and current():
+                self._applied_activity = None
+                result = await apply_state(self.output.catalog, ModelSelection(activity=name),
+                                           self.output, is_current=current)
+                if result.status == "completed" and current():
+                    self._applied_activity = name
+        finally:
+            if self._activity is activity:
+                self._activity = None
+            self._wardrobe_task = None
 
     async def _apply_wardrobe(self, body):
         observed = self.output.observed
@@ -175,11 +245,15 @@ class ProceduralAvatar:
             if observed is None or not current() or (body["model_id"], body["asset_version"]) != (
                     observed.model_id, observed.asset_version):
                 return
-            if isinstance(selection, dict) and selection.keys() == {"outfit"} and isinstance(selection["outfit"], str):
-                result = await apply_state(self.output.catalog, ModelSelection(outfit=selection["outfit"]),
-                                           self.output, is_current=current)
-            else:
-                result = ActionResult("unsupported", "unmapped_outfit")
+            result = ActionResult("unsupported", "unmapped_outfit")
+            if isinstance(selection, dict) and selection and selection.keys() <= {"outfit", "accessories", "expressions"}:
+                outfit = selection.get("outfit")
+                groups = {key: selection[key] for key in ("accessories", "expressions") if key in selection}
+                if (("outfit" not in selection or isinstance(outfit, str))
+                        and all(isinstance(names, list) and all(isinstance(name, str) for name in names)
+                                for names in groups.values())):
+                    selected = ModelSelection(outfit=outfit, **{key: frozenset(names) for key, names in groups.items()})
+                    result = await apply_state(self.output.catalog, selected, self.output, is_current=current)
             if current():
                 # Session/capability replacement releases this snapshot before
                 # a receipt could be attributed to another owner.
@@ -192,10 +266,11 @@ class ProceduralAvatar:
                 self._wardrobe = None
             self._wardrobe_task = None
 
-    async def stop_wardrobe(self):
-        if self._wardrobe_task is not None:
-            self._wardrobe_task.cancel()
-            await asyncio.gather(self._wardrobe_task, return_exceptions=True)
+    async def stop_model_tasks(self):
+        tasks = [task for task in (self._wardrobe_task, self._action_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _sync_model(self):
         if self._generation != self.output.generation:
@@ -268,8 +343,11 @@ class ProceduralAvatar:
     async def tick(self):
         """Sample once. Calls are serialized by run(), never queued to catch up."""
         self._sync_model()
-        if self._enabled and self._wardrobe is not None and self._wardrobe_task is None:
-            self._wardrobe_task = asyncio.create_task(self._apply_wardrobe(self._wardrobe))
+        if self._enabled and self._wardrobe_task is None and self._action_task is None:
+            if self._wardrobe is not None:
+                self._wardrobe_task = asyncio.create_task(self._apply_wardrobe(self._wardrobe))
+            elif self._activity is not None:
+                self._wardrobe_task = asyncio.create_task(self._apply_activity(self._activity))
         now = self.clock()
         elapsed = 0.0 if self._last_frame is None else now - self._last_frame
         self._last_frame = now
@@ -329,7 +407,7 @@ class ProceduralAvatar:
                 await asyncio.sleep(max(0, FRAME_PERIOD - (self.clock() - start)))
         finally:
             self.release("stopped")
-            await self.stop_wardrobe()
+            await self.stop_model_tasks()
 
 
 class AnimatedSession:

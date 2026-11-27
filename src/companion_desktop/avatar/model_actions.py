@@ -145,18 +145,17 @@ async def apply_state(
             return _unknown("parameter_state_unconfirmed")
         return ActionResult("completed", evidence={"source": "vts_model_readback", "ref": after.ref})
 
-    if not changes:
-        return verify(before)
     try:
-        await output.set_expressions(before, changes, is_current=is_current)
-        # The activation ACK can precede the next render. An old expression
-        # activated elsewhere can still be fading out (VTS allows up to 2 s).
-        await asyncio.sleep(0.05)
-        result = verify(await output.read_model())
-        if result.detail in {"expression_state_unconfirmed", "parameter_state_unconfirmed"}:
-            await asyncio.sleep(2)
-            if is_current():
-                result = verify(await output.read_model())
+        if changes:
+            await output.set_expressions(before, changes, is_current=is_current)
+        result = verify(before)
+        for delay in (0.05, 0.05, 0.2, 0.5, 1.25):
+            if result.detail not in {"expression_state_unconfirmed", "parameter_state_unconfirmed"}:
+                break
+            await asyncio.sleep(delay)
+            if not is_current():
+                return _unknown("model_changed_before_verification")
+            result = verify(await output.read_model())
         return result
     except StaleOutputError:
         return _stale()
@@ -167,7 +166,7 @@ async def apply_state(
 async def trigger_event(
     catalog: ModelCatalog, name: str, output: ModelOutput, *, is_current: Callable[[], bool],
 ) -> ActionResult:
-    """Send a current event once. P1 owns the task ledger, including lost acknowledgements."""
+    """Send a current event once and confirm dispatch with the VTS acknowledgement."""
     try:
         current = await output.read_model()
     except OSError:
@@ -185,4 +184,4 @@ async def trigger_event(
         return _stale()
     except OSError:
         return _unknown("event_acknowledgement_lost")
-    return ActionResult("accepted", evidence={"source": "vts_hotkey_ack", "ref": ref})
+    return ActionResult("completed", evidence={"source": "vts_hotkey_ack", "ref": ref})

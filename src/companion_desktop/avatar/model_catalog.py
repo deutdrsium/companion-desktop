@@ -44,6 +44,10 @@ class ModelReadback:
     expressions: Mapping[str, bool]
     animation_hotkeys: Mapping[str, str]
 
+    @staticmethod
+    def is_loaded(data, model_id):
+        return data.get("modelLoaded") is True and data.get("modelID") == model_id
+
     @classmethod
     def from_vts(cls, *, epoch, ref, model, asset_version, inputs, parameters, expressions, hotkeys):
         """Normalize results from the current-model, input, output, expression and hotkey reads."""

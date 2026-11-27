@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from functools import partial
@@ -11,6 +12,7 @@ from companion_desktop.avatar.model_actions import ModelSelection, StaleOutputEr
 from companion_desktop.avatar.model_catalog import MappingError, ModelReadback, load_mapping
 from companion_desktop.avatar.procedural import ProceduralAvatar
 from companion_desktop.avatar.vts import VTSOutput
+from companion_desktop.contracts.wire import message
 from companion_desktop.session.client import DesktopSession
 from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost
 
@@ -155,7 +157,7 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconnect_restores_latest_persistent_state_without_events(self):
         event = await trigger_event(self.catalog, "spark", self.output)
-        self.assertEqual(event.status, "accepted")
+        self.assertEqual(event.status, "completed")
         self.assertEqual(event.evidence["source"], "vts_hotkey_ack")
         self.output.epoch = "epoch-demo-2"
         latest = ModelSelection(activity="drawing", outfit="jacket", expressions=frozenset({"glitter"}))
@@ -206,27 +208,67 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         result = await apply_state(self.catalog, ModelSelection(activity="drawing"), self.output)
         self.assertEqual((result.status, result.detail), ("unknown", "parameter_state_unconfirmed"))
 
+    async def test_role_activity_restores_last_confirmed_pose_after_superseding_a_write(self):
+        state = self.output
+        output = VTSOutput(None, owned=())
+        output.bind(self.catalog, await state.read_model())
+        output.read_model = state.read_model
+        avatar = ProceduralAvatar(output)
+        idle = {"activity": "idle", "energy": None, "sleepiness": None, "emotion": None}
+
+        async def set_expressions(observed, changes, *, is_current):
+            await state.set_expressions(observed, changes, is_current=is_current)
+            if ("demo-sketch.exp3.json", True) in changes:
+                avatar.snapshot("role_state", idle, deadline=avatar.clock() + 5)
+
+        output.set_expressions = set_expressions
+        avatar.snapshot("role_state", idle, deadline=avatar.clock() + 5)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-idle.exp3.json"])
+
+        avatar.snapshot("role_state", {**idle, "activity": "drawing"}, deadline=avatar.clock() + 5)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-sketch.exp3.json"])
+        await avatar.tick()
+        self.assertIsNotNone(avatar._wardrobe_task)
+        await avatar._wardrobe_task
+        self.assertTrue(state.expressions["demo-idle.exp3.json"])
+        self.assertFalse(state.expressions["demo-sketch.exp3.json"])
+        self.assertEqual(len(state.expression_writes), 3)
+
     async def test_device_snapshot_uses_vts_and_reports_readback_across_model_reload(self):
         state = self.output
         state.expressions.update({"demo-casual.exp3.json": True, "demo-sketch.exp3.json": True,
                                   "demo-pin.exp3.json": True})
         activations = []
+        hotkey_writes = []
+        elapsed = 0
+
+        def clock():
+            return elapsed
 
         async def request(kind, data, *, is_current=lambda: True):
             if not is_current():
                 raise StaleOutputError
             model = await state.read_model()
+            identity = {"modelLoaded": True, "modelID": model.model_id}
             if kind == "CurrentModelRequest":
-                return {"modelLoaded": True, "modelID": model.model_id}
+                return identity
             if kind == "InputParameterListRequest":
-                return {"defaultParameters": [{"name": name} for name in model.inputs], "customParameters": []}
+                return {**identity, "defaultParameters": [{"name": name} for name in model.inputs], "customParameters": []}
             if kind == "ExpressionStateRequest":
-                return {"expressions": [{"file": file, "active": active} for file, active in model.expressions.items()]}
+                return {**identity, "expressions": [{"file": file, "active": active}
+                                                    for file, active in model.expressions.items()]}
             if kind == "HotkeysInCurrentModelRequest":
-                return {"availableHotkeys": [{"file": file, "type": "TriggerAnimation", "hotkeyID": hotkey}
-                                             for hotkey, file in model.animation_hotkeys.items()]}
+                return {**identity, "availableHotkeys": [{"file": file, "type": "TriggerAnimation", "hotkeyID": hotkey}
+                                                         for hotkey, file in model.animation_hotkeys.items()]}
             if kind == "Live2DParameterListRequest":
-                return {"parameters": [{"name": key, "value": value} for key, value in model.parameters.items()]}
+                return {**identity, "parameters": [{"name": key, "value": value} for key, value in model.parameters.items()]}
+            if kind == "HotkeyTriggerRequest":
+                hotkey_writes.append(data["hotkeyID"])
+                return data
             assert kind == "ExpressionActivationRequest" and data["fadeTime"] == 0
             file, active = data["expressionFile"], data["active"]
             activations.append((file, active))
@@ -238,10 +280,10 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         observed = await local._read_model(self.catalog, "epoch-demo-1")
         self.assertEqual(observed.animation_hotkeys, state.hotkeys)
         output.bind(self.catalog, observed)
-        avatar = ProceduralAvatar(output, wardrobe_report=lambda body: desktop.report(
+        avatar = ProceduralAvatar(output, clock=clock, wardrobe_report=lambda body: desktop.report(
             "wardrobe_applied", body, session=desktop.session))
         avatar.set_enabled(False)
-        host = SessionHost()
+        host = SessionHost(clock=clock)
         binding = Binding("device-demo", "binding-demo", frozenset({"avatar"}))
         desired = {"revision": 1, "model_id": state.model_id, "asset_version": state.asset_version,
                    "selection": {"outfit": "jacket"}, "mapping": None, "updated_at": "2026-01-01T12:00:00Z"}
@@ -250,15 +292,17 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
             return host.handle(binding, operation, payload,
                                snapshots=lambda caps: [("wardrobe", desired)] if caps["model_id"] == desired["model_id"] else [])
 
-        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar)
+        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar, clock=clock)
         self.addAsyncCleanup(desktop.close)
 
         def publish(revision):
             desktop.publish_capabilities({**avatar.capabilities(revision), "observations": [], "games": []})
 
         publish(1)
-        self.assertEqual([action["name"] for action in avatar.capabilities(1)["avatar"]["actions"]],
+        capabilities = avatar.capabilities(1)["avatar"]
+        self.assertEqual([action["name"] for action in capabilities["actions"] if action["name"].startswith("outfit.")],
                          ["outfit.casual", "outfit.jacket"])
+        self.assertEqual(capabilities["hotkeys"], ["hotkey-demo-spark"])
         await desktop._register()
         await desktop._exchange()
         avatar.set_enabled(True)
@@ -271,6 +315,23 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activations, [("demo-casual.exp3.json", False), ("demo-jacket.exp3.json", True)])
         self.assertTrue(state.expressions["demo-sketch.exp3.json"])
         self.assertTrue(state.expressions["demo-pin.exp3.json"])
+
+        intent = {"task_id": "event-demo", "scope": "avatar", "action": "event.spark", "params": {},
+                  "ttl_ms": 5000, "capability_revision": 1, "model_id": state.model_id}
+        host.send_intent(desktop.session, intent)
+        await desktop._exchange()
+        await avatar._action_task
+        await desktop._exchange()
+        receipt = host.receipt(desktop.session, intent["task_id"])
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["evidence"]["source"], "vts_hotkey_ack")
+        elapsed += 6
+        self.assertEqual(host.receipt(desktop.session, intent["task_id"]), receipt)
+        desktop.dispatcher.expire()
+        await desktop._exchange()
+        self.assertEqual(host.send_intent(desktop.session, intent), receipt)
+        desktop.dispatcher.receive(message("intent", desktop.session, intent))
+        self.assertEqual(hotkey_writes, ["hotkey-demo-spark"])
 
         avatar.handle_vts_event("ModelLoadedEvent", {})
         publish(2)
@@ -294,3 +355,98 @@ class ActionTests(unittest.IsolatedAsyncioTestCase):
         receipt = host.wardrobe_applied(desktop.session)
         self.assertEqual((receipt["status"], receipt["reason_code"]), ("unsupported", "unmapped_outfit"))
         self.assertEqual(len(activations), 3)
+        self.assertEqual(hotkey_writes, ["hotkey-demo-spark"])
+
+        state.hotkeys.clear()
+        host.send_intent(desktop.session, {**intent, "task_id": "missing-demo", "capability_revision": 3})
+        await desktop._exchange()
+        await avatar._action_task
+        await desktop._exchange()
+        self.assertEqual(host.receipt(desktop.session, "missing-demo")["status"], "unsupported")
+        self.assertEqual(hotkey_writes, ["hotkey-demo-spark"])
+
+        role = {"activity": "idle", "energy": None, "sleepiness": None, "emotion": None}
+        avatar.snapshot("role_state", role, deadline=avatar.clock() + 5)
+        await avatar.tick()
+        await avatar._wardrobe_task
+        self.assertEqual(activations[-2:], [("demo-sketch.exp3.json", False), ("demo-idle.exp3.json", True)])
+        self.assertTrue(state.expressions["demo-jacket.exp3.json"])
+
+        desired.update(revision=3, selection={"accessories": [], "expressions": ["warm"]})
+        await desktop._exchange()
+        await avatar.tick()
+        await avatar._wardrobe_task
+        await desktop._exchange()
+        self.assertEqual(host.wardrobe_applied(desktop.session)["status"], "completed")
+        self.assertEqual(activations[-2:], [("demo-pin.exp3.json", False), ("demo-cheeks.exp3.json", True)])
+        self.assertTrue(state.expressions["demo-jacket.exp3.json"])
+
+    async def test_vts_socket_ack_waits_for_live2d_readback_and_checks_model_identity(self):
+        local = LocalVTS(8001, None)
+        requests = []
+        model_id = self.catalog.model_id
+        parameter_reads = 0
+        active = False
+
+        class Socket:
+            def __init__(socket):
+                socket.replies = asyncio.Queue()
+                socket.parameter_model = model_id
+
+            def __aiter__(socket):
+                return socket
+
+            async def __anext__(socket):
+                return await socket.replies.get()
+
+            async def send(socket, raw):
+                nonlocal parameter_reads, active
+                frame = json.loads(raw)
+                kind = frame["messageType"]
+                requests.append(kind)
+                identity = {"modelLoaded": True, "modelID": model_id}
+                if kind == "CurrentModelRequest":
+                    data = identity
+                elif kind == "InputParameterListRequest":
+                    data = {**identity, "defaultParameters": [], "customParameters": []}
+                elif kind == "ExpressionStateRequest":
+                    data = {**identity, "expressions": [{"file": "demo-sketch.exp3.json", "active": active}]}
+                elif kind == "HotkeysInCurrentModelRequest":
+                    data = {**identity, "availableHotkeys": [
+                        {"hotkeyID": "hotkey-demo-spark", "file": "demo-spark.motion3.json", "type": "TriggerAnimation"}
+                    ]}
+                elif kind == "Live2DParameterListRequest":
+                    parameter_reads += 1
+                    value = int(active and parameter_reads >= 4)
+                    data = {"modelLoaded": True, "modelID": socket.parameter_model,
+                            "parameters": [{"name": "DemoPose", "value": value}]}
+                elif kind == "ExpressionActivationRequest":
+                    active = True
+                    data = {}
+                else:
+                    assert kind == "HotkeyTriggerRequest"
+                    data = {"hotkeyID": "different-demo-hotkey"}
+                await socket.replies.put(json.dumps({"requestID": frame["requestID"],
+                    "messageType": kind.removesuffix("Request") + "Response", "data": data}))
+
+        local.socket = Socket()
+        listener = asyncio.create_task(local._listen(local.socket, None))
+
+        async def stop_listener():
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
+
+        self.addAsyncCleanup(stop_listener)
+        output = VTSOutput(local.request, owned=())
+        output.bind(self.catalog, await local._read_model(self.catalog, "epoch-demo"))
+        result = await apply_state(self.catalog, ModelSelection(activity="drawing"), output)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(parameter_reads, 4)
+        self.assertEqual(requests.count("ExpressionActivationRequest"), 1)
+        self.assertEqual((await trigger_event(self.catalog, "spark", output)).status, "unknown")
+        self.assertEqual(requests.count("HotkeyTriggerRequest"), 1)
+
+        local.socket.parameter_model = "model-other-demo"
+        self.assertIsNone(await local._read_model(self.catalog, "other-epoch-demo"))
+        self.assertEqual((await trigger_event(self.catalog, "spark", output)).detail, "readback_unavailable")
+        self.assertEqual(requests.count("HotkeyTriggerRequest"), 1)

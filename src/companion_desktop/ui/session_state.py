@@ -16,11 +16,17 @@ from .theme import MOTION, STATE
 
 PRESENCE = ("idle", "listening", "thinking", "speaking", "interrupted")
 CONNECTION = ("connecting", "connected", "offline")
+CONNECTION_ERRORS = {
+    "disabled": "服务器已关闭桌面会话",
+    "unauthorized": "设备绑定或连接凭据未获授权",
+    "unsupported_protocol": "服务器不支持桌面会话协议",
+}
 
 
 class SessionState(QObject):
     changed = pyqtSignal(object)  # emits self
     progressed = pyqtSignal(float)  # current segment playback fraction
+    speech_start_timed_out = pyqtSignal()
 
     # Exit safeguard: thinking must always end (B05). If text arrived but no audio
     # started within this window, fall back to idle.
@@ -41,6 +47,8 @@ class SessionState(QObject):
         self.attempt = 0
         self.next_retry_at = None
         self.reason = ""
+        self.connection_closed = False
+        self.permissions = None
         self.capturing = False
         self.periodic = False
         self.autonomous = False
@@ -72,7 +80,7 @@ class SessionState(QObject):
 
     @property
     def can_send(self):
-        return self.connection == "connected"
+        return self.connection == "connected" and (self.permissions is None or "speak" in self.permissions)
 
     @property
     def waited_s(self):
@@ -89,7 +97,11 @@ class SessionState(QObject):
     def status_text(self):
         s = self.state
         if s == "offline":
+            if self.connection_closed:
+                return CONNECTION_ERRORS.get(self.reason, "桌面会话已关闭")
             return "连接断开 · 正在重连"
+        if self.connection == "connected" and not self.can_send:
+            return "设备未获对话授权"
         if s == "observing":
             return "正在看当前窗口"
         if s == "thinking":
@@ -105,17 +117,24 @@ class SessionState(QObject):
     def _emit(self):
         self.changed.emit(self)
 
-    def set_connection(self, state, attempt=0, next_retry_ms=None, reason=""):
+    def set_connection(self, state, attempt=0, next_retry_ms=None, reason="", *, closed=False):
         assert state in CONNECTION, state
         self.connection = state
         self.attempt = attempt
         self.next_retry_at = None if next_retry_ms is None else self.clock() + next_retry_ms / 1000.0
         self.reason = reason
+        self.connection_closed = closed
         if state == "offline":
             self.capturing = False
             if self.presence in ("thinking", "speaking", "listening"):
                 self._set_presence("idle")
         self._emit()
+
+    def set_permissions(self, permissions):
+        updated = frozenset(permissions)
+        if self.permissions != updated:
+            self.permissions = updated
+            self._emit()
 
     def set_typing(self, active):
         self.typing = bool(active)
@@ -189,7 +208,7 @@ class SessionState(QObject):
             mapping = {"connecting": "connecting", "connected": "connected",
                        "reconnecting": "offline", "closed": "offline"}
             self.set_connection(mapping.get(event.get("state"), "offline"), event.get("attempt", 0),
-                                event.get("next_retry_ms"), event.get("reason", ""))
+                                event.get("next_retry_ms"), event.get("reason", ""), closed=event.get("state") == "closed")
         elif kind == "presence" and event.get("state") in PRESENCE:
             self._set_presence(event["state"])
             if event["state"] == "interrupted":
@@ -239,5 +258,7 @@ class SessionState(QObject):
 
     def _speech_never_started(self):
         if self.presence == "thinking":
-            self._set_presence("idle")
-            self._emit()
+            turn_id = self.turn_id
+            self.speech_start_timed_out.emit()
+            if self.turn_id == turn_id:
+                self.speech_finished()

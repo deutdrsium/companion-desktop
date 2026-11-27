@@ -106,6 +106,7 @@ class Controller(QObject):
         b.screen_result.connect(self._screen_result)
         if self.device:
             b.connection.connect(self._device_connection)
+            b.permissions_changed.connect(self.state.set_permissions)
             b.utterance_cancelled.connect(self._utterance_cancelled)
             b.voice_revoked.connect(self._voice_revoked)
             b.pcm.connect(self._pcm)
@@ -127,6 +128,7 @@ class Controller(QObject):
             self.state.progressed.connect(lambda f: self.subtitles.set_state("speaking", None, f)
                                           if self.state.presence == "speaking" else None)
         self.state.changed.connect(self._state_changed)
+        self.state.speech_start_timed_out.connect(self._speech_start_timeout)
         self.prefs.changed.connect(self._pref)
         if self.tray is not None:
             self.attach_tray(self.tray)
@@ -394,11 +396,15 @@ class Controller(QObject):
             bubble.set_receipt("failed")
             if bubble not in self.resend:
                 self.resend.append(bubble)
-        elif reason in ("rejected", "busy"):
+        elif reason in {"rejected", "busy", "unauthorized", "invalid_request", "invalid_config", "result_unknown"}:
             bubble.set_receipt("failed")
-            if reason == "busy":
-                bubble.meta_label.setText("上一条还在处理")
-            self.panel.composer.restore_draft(bubble.text)   # keep typed text on failure
+            detail = {"busy": "上一条还在处理", "unauthorized": "设备未获对话授权",
+                      "invalid_request": "发送内容不符合要求", "invalid_config": "重发内容与原消息不一致",
+                      "result_unknown": "无法确认处理结果"}.get(reason)
+            if detail:
+                bubble.meta_label.setText(detail)
+            if reason != "result_unknown":
+                self.panel.composer.restore_draft(bubble.text)
         else:  # the reply broke off midway
             bubble.set_receipt("delivered")
             clean = visible_text(partial)
@@ -522,6 +528,11 @@ class Controller(QObject):
         if self.device:
             self.stop_speech()
         self._speech_failed(index)
+
+    def _speech_start_timeout(self):
+        self.stop_speech()
+        self.reading_gen = None
+        self._speech_failed(0)
 
     def _speech_failed(self, index):
         bubble = self.reading
@@ -668,6 +679,8 @@ class Controller(QObject):
             turn = self.turns[self.active_turn]
             if (event["state"] == "connected" and self.state.presence != "thinking"
                     and not turn.get("cancel_requested")):
+                if self.avatar is not None:
+                    self.avatar.message_sent(self.active_turn)
                 self.state.turn_sent(self.active_turn)
         elif event["state"] != "connected" and not self.quitting:
             self.stop()

@@ -38,6 +38,9 @@ class LocalVTS:
             frame = await asyncio.wait_for(reply, timeout)
             if frame["messageType"] == "APIError":
                 raise OSError("VTS rejected the request")
+            if (frame["messageType"] != kind.removesuffix("Request") + "Response"
+                    or not isinstance(frame.get("data"), dict)):
+                raise OSError("Unexpected VTS response")
             return frame["data"]
         except (asyncio.TimeoutError, WebSocketException) as error:
             raise OSError("VTS connection failed") from error
@@ -93,6 +96,9 @@ class LocalVTS:
         expressions = await self.request("ExpressionStateRequest", {"details": False})
         hotkeys = await self.request("HotkeysInCurrentModelRequest", {})
         parameters = await self.request("Live2DParameterListRequest", {})
+        if not all(ModelReadback.is_loaded(reply, catalog.model_id)
+                   for reply in (inputs, expressions, hotkeys, parameters)):
+            return None
         return ModelReadback.from_vts(epoch=epoch, ref=uuid4().hex, model=model, asset_version=catalog.asset_version,
                                       inputs=inputs["defaultParameters"] + inputs["customParameters"],
                                       parameters=parameters["parameters"], expressions=expressions["expressions"],
@@ -116,6 +122,8 @@ class LocalVTS:
                                 continue
                             if observed is not None:
                                 output.bind(catalog, observed)
+                            elif output.observed is not None:
+                                output.invalidate()
                             publish()
                             # Also recover if the frame writer invalidated a timed-out connection.
                             generation = output.generation

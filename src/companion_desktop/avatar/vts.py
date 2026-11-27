@@ -1,9 +1,9 @@
 """Frame adapter for an authenticated, local VTube Studio API connection."""
 
-from dataclasses import replace
 from uuid import uuid4
 
 from .model_actions import StaleOutputError
+from .model_catalog import ModelReadback
 from .motion import NEUTRAL, unit
 
 
@@ -53,9 +53,9 @@ class VTSOutput:
         reserved = {item.input_id for item in catalog.inputs.values() if item.parameter in persistent}
         by_parameter = {item.parameter: item for item in catalog.inputs.values()}
         for channel, parameter in CHANNELS.items():
-            binding = by_parameter.get(parameter)
+            binding = catalog.inputs.get(channel) or by_parameter.get(parameter)
             if (channel in self._owned and binding is not None and binding.input_id not in reserved
-                    and binding.input_id in observed.inputs and parameter in observed.parameters
+                    and binding.input_id in observed.inputs and binding.parameter in observed.parameters
                     and binding.output_range[0] != binding.output_range[1]):
                 self.bindings[channel] = binding
                 reserved.add(binding.input_id)
@@ -75,18 +75,20 @@ class VTSOutput:
             raise OSError("No mapped VTS model")
         current = lambda: self.observed is observed
         try:
-            model = await self._request("CurrentModelRequest", {}, is_current=current)
-            if not model["modelLoaded"] or model["modelID"] != observed.model_id:
-                raise OSError("VTS model changed")
             expressions = await self._request("ExpressionStateRequest", {"details": False}, is_current=current)
+            hotkeys = await self._request("HotkeysInCurrentModelRequest", {}, is_current=current)
             parameters = await self._request("Live2DParameterListRequest", {}, is_current=current)
         except StaleOutputError as error:
             raise OSError("VTS model changed") from error
-        if not current():
+        if not current() or not all(
+            ModelReadback.is_loaded(reply, observed.model_id) for reply in (expressions, hotkeys, parameters)
+        ):
             raise OSError("VTS model changed")
-        return replace(observed, ref=uuid4().hex,
-                       expressions={row["file"]: row["active"] for row in expressions["expressions"]},
-                       parameters={row["name"]: row["value"] for row in parameters["parameters"]})
+        return ModelReadback.from_vts(
+            epoch=observed.epoch, ref=uuid4().hex, model=parameters, asset_version=observed.asset_version,
+            inputs=({"name": name} for name in observed.inputs), parameters=parameters["parameters"],
+            expressions=expressions["expressions"], hotkeys=hotkeys["availableHotkeys"],
+        )
 
     async def set_expressions(self, observed, changes, *, is_current):
         def current():
@@ -106,7 +108,9 @@ class VTSOutput:
         def current():
             return self.observed is not None and self.observed.epoch == observed.epoch and is_current()
 
-        await self._request("HotkeyTriggerRequest", {"hotkeyID": hotkey_id}, is_current=current)
+        result = await self._request("HotkeyTriggerRequest", {"hotkeyID": hotkey_id}, is_current=current)
+        if result.get("hotkeyID") != hotkey_id or not current():
+            raise OSError("VTS hotkey acknowledgement unconfirmed")
         return uuid4().hex
 
     async def write(self, frame, *, is_current):

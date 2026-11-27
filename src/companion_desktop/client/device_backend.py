@@ -42,6 +42,7 @@ class DeviceBackend(LegacyBackend):
     connection = pyqtSignal(object)
     utterance_cancelled = pyqtSignal(str)
     voice_revoked = pyqtSignal()
+    permissions_changed = pyqtSignal(object)
 
     def __init__(self, base, key, cfg, folder, *, tts=True, subtitle=False):
         super().__init__(base, key, cfg)
@@ -54,6 +55,7 @@ class DeviceBackend(LegacyBackend):
         self.cursor_timer.timeout.connect(self._cursor)
         self.avatar = self.vts = self.catalog = None
         self.revision = 1
+        self._idle_revision = None
         self.cues = {}
         self.turn_ids = {}
         self.cancel_pending = set()
@@ -97,18 +99,27 @@ class DeviceBackend(LegacyBackend):
     def _report_wardrobe(self, body):
         self.session.report("wardrobe_applied", body, session=self.session.session)
 
+    def _update_avatar_output(self):
+        connection = self.session.connection
+        if connection["state"] == "connected":
+            if ("avatar" in self.session.dispatcher.permissions
+                    and self.session.capabilities_published(self.revision)):
+                self._idle_revision = self.revision
+            else:
+                self._idle_revision = None
+        elif connection["state"] != "reconnecting" or connection["reason"] not in {"connection_lost", "stale_session"}:
+            self._idle_revision = None
+        self.avatar.set_enabled(self._idle_revision == self.revision and self.avatar.output.observed is not None)
+
     async def _frames(self):
         try:
             while True:
                 before = self.loop.time()
-                self.avatar.set_enabled(self.session.connection["state"] == "connected"
-                                        and "avatar" in self.session.dispatcher.permissions
-                                        and self.session.capabilities_published(self.revision)
-                                        and self.avatar.output.observed is not None)
+                self._update_avatar_output()
                 await self.avatar.tick()
                 await asyncio.sleep(max(0, FRAME_PERIOD - (self.loop.time() - before)))
         finally:
-            await self.avatar.stop_wardrobe()
+            await self.avatar.stop_model_tasks()
 
     def _pump(self):
         self.loop.call_soon(self.loop.stop)
@@ -129,7 +140,7 @@ class DeviceBackend(LegacyBackend):
         super().load_history()
 
     def reconnect_session(self):
-        self.loop.call_soon(self.session.start)
+        self.loop.call_soon(self.session.reconnect)
 
     def _history_loaded(self, *_):
         self.history_ready = True
@@ -157,11 +168,17 @@ class DeviceBackend(LegacyBackend):
     def _event(self, event):
         kind = event["type"]
         if kind == "connection":
+            if self.avatar is not None:
+                self._update_avatar_output()
             if event["state"] != "connected":
                 self.cues.clear()
             if self.history_ready or event["state"] != "connected":
                 self.connection.emit(event)
         elif kind == "capabilities":
+            if event["permissions"] is not None:
+                if self.avatar is not None:
+                    self._update_avatar_output()
+                self.permissions_changed.emit(event["permissions"])
             had_voice, self.had_voice = self.had_voice, event["tts"]
             if had_voice and not self.had_voice:
                 self.voice_revoked.emit()
@@ -187,7 +204,8 @@ class DeviceBackend(LegacyBackend):
             accepted = self.turn_ids.pop(client_id, None) is not None
             self.cancel_pending.discard(client_id)
             reason = event["reason"]
-            if reason != "busy":
+            if reason not in {"busy", "unauthorized", "invalid_request", "invalid_config",
+                              "result_unknown", "generation_failed"}:
                 reason = "interrupted" if accepted else "rejected"
             self.chat_failed.emit(client_id, reason, "")
         elif kind == "turn.cancelled" and event["status"] == "cancelled":
