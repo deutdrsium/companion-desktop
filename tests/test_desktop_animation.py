@@ -253,6 +253,74 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.model.parameters["DemoOutfit"], 1)
         print("B02 fake: listening → thinking → laugh with shut lids and open mouth → immediate mouth close → reading base")
 
+    async def test_default_blinks_close_and_reopen_both_eyes_while_tired(self):
+        for label in ("sleepy", "drowsy"):
+            with self.subTest(label=label):
+                await self.check_default_blinks(label)
+
+    async def check_default_blinks(self, label):
+        rig = Rig()
+        await rig.step(0)
+        rig.avatar.snapshot("role_state", rig.role(1, activity=label, energy=0.05,
+                                                   sleepiness=0.95, emotion=label), deadline=60)
+        await rig.frames(30 * 25)
+        lids = [frame["eye_left"] for frame in rig.vts.frames]
+        self.assertEqual(lids, [frame["eye_right"] for frame in rig.vts.frames])
+        starts = [index for index in range(1, len(lids)) if lids[index - 1] == 1 and lids[index] < 1]
+        self.assertGreaterEqual(len(starts), 4)
+        previous_end = 0
+        for start in starts:
+            self.assertGreaterEqual((start - previous_end) * FRAME_PERIOD, 2.8 - FRAME_PERIOD)
+            self.assertLessEqual((start - previous_end) * FRAME_PERIOD, 5.5 + FRAME_PERIOD)
+            end = lids.index(1.0, start)
+            self.assertLessEqual((end - start) * FRAME_PERIOD, 0.25 + FRAME_PERIOD)
+            samples = lids[start:end]
+            self.assertIn(0.0, samples)
+            closed = samples.index(0.0)
+            self.assertTrue(any(0 < lid < 1 for lid in samples[:closed]))
+            self.assertTrue(any(0 < lid < 1 for lid in samples[closed:]))
+            previous_end = end
+        self.assertLess(rig.vts.frames[-1]["brow_left"], -0.12)
+
+    async def test_real_sleep_holds_both_vts_eyes_closed_until_waking(self):
+        for activity in ("sleep", "sleeping"):
+            with self.subTest(activity=activity):
+                rig = Rig()
+                self.assertNotIn(activity, rig.catalog.activities)
+                await rig.step(0)
+                self.assertEqual(rig.vts.frames[-1]["eye_left"], 1.0)
+                sleep_at = len(rig.vts.frames)
+                rig.avatar.snapshot("role_state", rig.role(1, activity=activity), deadline=11)
+                await rig.step(0)
+                await rig.frames(300)
+                rig.avatar.motion.blink()
+                await rig.step(PAUSE_GAP + 0.1)
+                self.assertTrue(all(frame["eye_left"] == frame["eye_right"] == 0.0
+                                    for frame in rig.vts.frames[sleep_at:]))
+
+                if activity == "sleep":
+                    rig.avatar.snapshot("role_state", rig.role(2, activity="drowsy"), deadline=30)
+                    await rig.step(0)
+                else:
+                    await rig.step(PAUSE_GAP + 0.1)
+                    self.assertIsNone(rig.avatar.motion.role_state)
+                self.assertEqual(rig.vts.frames[-1]["eye_left"], 1.0)
+                self.assertEqual(rig.vts.frames[-1]["eye_right"], 1.0)
+                self.assertTrue(all(frame["eye_left"] == frame["eye_right"] == 1.0
+                                    for frame in await rig.frames(60)))
+                self.assertTrue(any(frame["eye_left"] == frame["eye_right"] == 0.0
+                                    for frame in await rig.frames(114)))
+
+    async def test_frame_gap_reopens_interrupted_blink(self):
+        rig = Rig()
+        await rig.step(0)
+        rig.avatar.motion.blink()
+        await rig.frames(3)
+        self.assertEqual(rig.vts.frames[-1]["eye_left"], 0.0)
+        await rig.step(PAUSE_GAP)
+        self.assertEqual(rig.vts.frames[-1]["eye_left"], 1.0)
+        self.assertEqual(rig.vts.frames[-1]["eye_right"], 1.0)
+
     async def test_b03_real_p1_session_state_intent_and_host_disconnect(self):
         rig = Rig(missing=("eye_smile", "breath"))
         role = rig.role(1, activity="reading")
@@ -314,7 +382,8 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
 
         await update(sleepiness=0.95)
         sleepy = await rig.frames(80)
-        self.assertTrue(all(frame["eye_left"] < 0.85 for frame in sleepy[-15:]))
+        self.assertAlmostEqual(max(min(frame["eye_left"], frame["eye_right"]) for frame in sleepy[-15:]),
+                               1.0, delta=0.001)
         await update(emotion="happy", ttl_ms=3000)
         happy = (await rig.frames(70))[-1]
         self.assertAlmostEqual(happy["mouth_form"], 0.26, delta=0.02)
@@ -327,7 +396,7 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(abs(after_expiry["mouth_form"]), 0.01)
         self.assertIsNone(rig.avatar.motion.role_state)
         self.assertNotEqual(after_expiry["head_yaw"], happy["head_yaw"])
-        print("B03 P1 + fake: reading low gaze, sleepy lids, happy mouth form; disconnect kept idle, TTL faded state")
+        print("B03 P1 + fake: reading low gaze, open eyes despite fatigue, happy mouth form; TTL faded state")
 
     async def test_explicit_laugh_cancel_releases_only_its_channels(self):
         rig = Rig()
