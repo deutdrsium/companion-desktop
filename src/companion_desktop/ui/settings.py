@@ -13,7 +13,8 @@ from .paint import StateAvatar, Toggle
 from .theme import C, STATE
 from .widgets import button, hline, label, set_label_color
 
-PAGES = ("外观", "声音", "字幕", "回复节奏", "观察", "连接")
+PAGES = ("外观", "声音", "字幕", "回复节奏", "观察", "一起听看", "连接")
+TOGETHER_PRIVACY = "只有标题、播放进度和当前这一句字幕或歌词会离开这台电脑；画面、声音和文件本身都不会。"
 
 # Reply-rhythm presets: (min wait, max wait, total cap) in ms.
 RHYTHM_PRESETS = [("快", 300, 1000, 3000), ("适中", 600, 1500, 4000), ("从容", 1500, 3000, 8000)]
@@ -28,7 +29,7 @@ class Prefs(QObject):
     DEFAULTS = {"pinned": True, "close_to_tray": True, "voice_enabled": True, "volume": 100,
                 "subtitle_style": "plate", "subtitle_size": 100, "subtitle_hold_ms": 1800,
                 "subtitle_nameplate": True, "consent_periodic": False, "consent_autonomous": False,
-                "tray_hint_shown": False}
+                "tray_hint_shown": False, "together_enabled": True, "together_source": "local_player"}
 
     def __init__(self, org="CompanionDesktop", app="Panel"):
         super().__init__()
@@ -428,7 +429,7 @@ class SettingsWindow(QWidget):
         self.rhythm = RhythmPage(rhythm_service)
         self.subtitle_url = subtitle_url
         for build in (self._appearance, self._voice, self._subtitle, lambda: self.rhythm,
-                      self._observe, self._connection):
+                      self._observe, self._together, self._connection):
             page = QWidget()
             pv = QVBoxLayout(page)
             pv.setContentsMargins(28, 24, 28, 20)
@@ -555,6 +556,31 @@ class SettingsWindow(QWidget):
                 _row(f"让{self.character.name}自己决定看一眼", self.obs_autonomous,
                      "需要新版桌面会话，暂不可用。"),
                 hline(), now]
+
+    def _together(self):
+        name = self.character.name
+        sources = ("local_player", "system_media")
+        source = Segmented(["桌面播放器", "正在播放的软件"])
+        current = self.prefs.get("together_source")
+        source.select(sources.index(current) if current in sources else 0)
+        source.picked.connect(lambda i: self.prefs.set("together_source", sources[i]))
+        self.together_source = source
+        self.together_note = label("", "caption", theme.ERROR_FG, wrap=True)
+        self.together_note.hide()
+        return [label("一起听看", "title"),
+                label(f"听歌或看电影时，{name}可以陪着你，偶尔轻声说一两句。每次都要你自己点开始。",
+                      "body", "ink2", wrap=True),
+                _row("一起听 / 一起看", self._toggle("together_enabled", "一起听 / 一起看"),
+                     "关掉后面板和托盘里的入口只会说明为什么不能用；正在进行的会立即结束。"),
+                _row("默认来源", source, "桌面播放器：在面板里选一个本地文件，可加 SRT 字幕或 LRC 歌词。"
+                     "正在播放的软件：跟着 Windows 报告的播放器，只读状态，不替它控制播放。"),
+                self.together_note, hline(),
+                label("会发送什么", "body", bold=True),
+                label(TOGETHER_PRIVACY, "body", "ink2", wrap=True)]
+
+    def set_together_note(self, text):
+        self.together_note.setText(text or "")
+        self.together_note.setVisible(bool(text))
 
     def set_observe_switches(self, periodic, autonomous):
         for t, v in ((self.obs_periodic, periodic), (self.obs_autonomous, autonomous)):

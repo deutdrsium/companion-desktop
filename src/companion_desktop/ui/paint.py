@@ -8,7 +8,7 @@ import math
 import sys
 
 from PyQt5.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PyQt5.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QAbstractButton, QWidget
 
 from . import theme
@@ -82,6 +82,27 @@ def draw_icon(p, name, rect, color, width=1.6):
         p.setBrush(QColor(color))
         for dx in (-6, 0, 6):
             p.drawEllipse(QPointF(cx + dx * u, cy), 1.5 * u, 1.5 * u)
+    elif name in ("note", "note_on"):
+        if name == "note_on":
+            p.setBrush(QColor(color))
+        p.drawEllipse(QPointF(cx - 3.5 * u, cy + 4.5 * u), 2.6 * u, 2.1 * u)
+        p.drawEllipse(QPointF(cx + 4.5 * u, cy + 2.5 * u), 2.6 * u, 2.1 * u)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(QPointF(cx - 1 * u, cy + 4.5 * u), QPointF(cx - 1 * u, cy - 6 * u))
+        p.drawLine(QPointF(cx + 7 * u, cy + 2.5 * u), QPointF(cx + 7 * u, cy - 7.5 * u))
+        p.drawLine(QPointF(cx - 1 * u, cy - 6 * u), QPointF(cx + 7 * u, cy - 7.5 * u))
+    elif name in ("play", "pause"):
+        if name == "play":
+            p.setBrush(QColor(color))
+            p.drawPolygon(QPolygonF([QPointF(cx - 3.5 * u, cy - 5 * u), QPointF(cx + 5 * u, cy),
+                                     QPointF(cx - 3.5 * u, cy + 5 * u)]))
+        else:
+            p.drawLine(QPointF(cx - 2.5 * u, cy - 5 * u), QPointF(cx - 2.5 * u, cy + 5 * u))
+            p.drawLine(QPointF(cx + 2.5 * u, cy - 5 * u), QPointF(cx + 2.5 * u, cy + 5 * u))
+    elif name in ("collapse", "expand"):
+        d = -1 if name == "collapse" else 1
+        p.drawPolyline(QPointF(cx - 5 * u, cy - 2.5 * u * d), QPointF(cx, cy + 2.5 * u * d),
+                       QPointF(cx + 5 * u, cy - 2.5 * u * d))
     elif name == "send":
         p.drawLine(QPointF(cx, cy + 6 * u), QPointF(cx, cy - 6 * u))
         p.drawLine(QPointF(cx - 5 * u, cy - 1 * u), QPointF(cx, cy - 6 * u))

@@ -75,6 +75,16 @@ class SharedMedia(QObject):
     def current_item(self):
         return self._snapshot() if self._item is not None else None
 
+    @property
+    def active(self):
+        """True between a successful ``start()`` and the end of sharing."""
+        return self._armed
+
+    @property
+    def current_line(self):
+        """The timed-text line at the current position, for local display only."""
+        return self._context()[0] if self._armed else None
+
     def load_local(self, path, timed_text=None):
         timeline = TimedText.load(timed_text) if timed_text else None
         self._loading_local = True

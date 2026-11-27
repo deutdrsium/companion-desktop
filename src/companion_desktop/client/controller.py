@@ -17,6 +17,7 @@ from ..ui.observe import ConsentDialog
 from ..ui.panel import Panel
 from ..ui.session_state import SessionState
 from ..ui.settings import SettingsWindow
+from ..ui.together import Together
 from .audio import PcmClip
 from .protocol import desktop_locked, sentences, visible_text, vts_running
 from .timeline import CueTrack, PlaybackLevel
@@ -92,6 +93,15 @@ class Controller(QObject):
             if self.barge_in is not None:
                 self.shared_media.state_changed.connect(self._media_mic)
                 self.barge_in.speech_ended.connect(lambda: self.shared_media.set_owner_speaking(False))
+        if not device:
+            off = "一起听/看需要新版桌面会话：本机设置里的 server.device_session 还没打开。"
+        elif self.shared_media is None:
+            off = "一起听/看还没开启：本机设置里的 shared_media_enabled 是关闭的。打开后重启面板。"
+        else:
+            off = None
+        self.together = Together(self.shared_media, self.panel, prefs, self.state, character.name, off,
+                                 presented=lambda reaction_id: reaction_id == self._media_reaction_id)
+        self.together.active_changed.connect(self._together_active)
 
     # ------------------------------------------------------------ wiring
     def _wire(self):
@@ -152,6 +162,7 @@ class Controller(QObject):
             t.periodic_toggled.connect(self.set_periodic)
             t.autonomous_toggled.connect(self.set_autonomous)
             t.look_now.connect(self.look_now)
+            t.together.connect(self._open_together)
             t.copy_subtitle_url.connect(self.copy_subtitle_url)
             t.pin_toggled.connect(lambda on: self.prefs.set("pinned", on))
             t.open_settings.connect(lambda: self.open_settings(0))
@@ -216,10 +227,19 @@ class Controller(QObject):
             s.copy_subtitle_url.connect(self.copy_subtitle_url)
             self.settings = s
         self.settings.set_observe_switches(self.periodic, False)
+        self.settings.set_together_note(self.together.reason(ignore_pref=True))
         self.settings.show_page(page)
         self.settings.show()
         self.settings.raise_()
         self.settings.activateWindow()
+
+    def _open_together(self):
+        self.show_panel()
+        self.together.open()
+
+    def _together_active(self, active):
+        if self.tray is not None:
+            self.tray.set_together(active, "一起看" if self.together.kind == "movie" else "一起听")
 
     def open_logs(self):
         if self.log_dir:

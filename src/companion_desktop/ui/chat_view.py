@@ -216,6 +216,32 @@ class ReplyBubble(_Row):
             self.replay.emit(self)
 
 
+class ReactionBubble(_Row):
+    """A short remark while listening or watching together: a smaller companion bubble."""
+
+    RATIO = 0.62
+
+    def __init__(self, text, kind="music", at=None):
+        super().__init__(companion=True)
+        self.text, self.kind, self.at = text, kind, at
+        self.plain = text
+        self.inner.setContentsMargins(12, 7, 12, 7)
+        self.body.setFont(theme.font("body", voice=True))
+        self.body.setText(_para(_esc(text), voice=True))
+        self.body.setAccessibleName("一起" + ("看" if kind == "movie" else "听") + "时说：" + text)
+        stamp = time.strftime("%H:%M", time.localtime(at)) if at else ""
+        self.meta = label(("一起看" if kind == "movie" else "一起听") + (f" · {stamp}" if stamp else ""),
+                          "caption", "ink3")
+        self.col.addWidget(self.meta, 0, Qt.AlignLeft)
+
+    def fit(self, viewport_w=None):
+        if viewport_w:
+            self.viewport_w = viewport_w
+        max_w = int(self.viewport_w * self.RATIO) - 24
+        fm = QFontMetrics(self.body.font())
+        self.body.setFixedWidth(max(40, min(fm.horizontalAdvance(self.plain or " ") + 6, max_w)))
+
+
 class ThinkingBubble(QWidget):
     def __init__(self):
         super().__init__()
@@ -378,3 +404,19 @@ class ChatView(QScrollArea):
 
     def add_note(self, state, text):
         return self._add(Note(state, text))
+
+    def add_reaction(self, text, kind="music", at=None):
+        at = at or time.time()
+        self.last_at = at
+        return self._add(ReactionBubble(text, kind, at))
+
+    def remove_item(self, widget):
+        """Take an item out quietly (a cancelled reaction); nothing is left in its place."""
+        if widget in self.items:
+            self.items.remove(widget)
+        elif widget in self.hidden:
+            self.hidden.remove(widget)
+            return
+        self.lay.removeWidget(widget)
+        widget.hide()
+        widget.deleteLater()

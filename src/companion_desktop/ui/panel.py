@@ -42,9 +42,10 @@ class Header(QWidget):
         v.addStretch(1)
         h.addLayout(v, 1)
         self.eye = IconButton("eye", f"{character.name}能看到什么", tint=STATE["observing"]["ring"])
+        self.together = IconButton("note", "一起听 / 一起看")
         self.pin = IconButton("pin", "窗口置顶")
         self.more = IconButton("more", "更多")
-        for b in (self.eye, self.pin, self.more):
+        for b in (self.eye, self.together, self.pin, self.more):
             h.addWidget(b)
         self.setAccessibleName(character.name)
 
@@ -99,12 +100,19 @@ class Panel(QWidget):
         self.banner_wrap = wrap
         wrap.hide()
         v.addWidget(wrap)
+        # now-playing card while listening / watching together (filled by ui.together)
+        self.media_wrap = QWidget()
+        self.media_slot = QVBoxLayout(self.media_wrap)
+        self.media_slot.setContentsMargins(14, 10, 14, 0)
+        self.media_wrap.hide()
+        v.addWidget(self.media_wrap)
         self.chat = ChatView()
         v.addWidget(self.chat, 1)
         self.composer = Composer(character.name)
         v.addWidget(self.composer)
         self.toast = Toast(self)
         self.popover = ObservePopover(self, character.name, anchor=self.header.eye)
+        self.layers = [self.popover]
         self.pinned = pinned
         self.header.pin.set_look("pin_on" if pinned else "pin", pinned)
         self.header.pin.clicked.connect(lambda: self.set_pinned(not self.pinned, emit=True))
@@ -120,7 +128,8 @@ class Panel(QWidget):
         # Tab order: input -> send -> header icons -> conversation
         self.setTabOrder(self.composer.entry, self.composer.button)
         self.setTabOrder(self.composer.button, self.header.eye)
-        self.setTabOrder(self.header.eye, self.header.pin)
+        self.setTabOrder(self.header.eye, self.header.together)
+        self.setTabOrder(self.header.together, self.header.pin)
         self.setTabOrder(self.header.pin, self.header.more)
         state.changed.connect(self._state)
         self._state(state)
@@ -194,7 +203,8 @@ class Panel(QWidget):
         m.addAction("设置…", lambda: self.open_settings.emit(0))
         m.addAction("复制 VTS 字幕地址", self.copy_subtitle_url.emit)
         m.addAction("声音…", lambda: self.open_settings.emit(1))
-        m.addAction("关于", lambda: self.open_settings.emit(5))
+        m.addAction("一起听 / 一起看…", lambda: self.header.together.click())
+        m.addAction("关于", lambda: self.open_settings.emit(6))
         m.addSeparator()
         m.addAction("退出", self.quit.emit)
         return m
@@ -208,7 +218,7 @@ class Panel(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        for layer in (self.popover,):
+        for layer in self.layers:
             if layer.isVisible():
                 layer.setGeometry(self.rect())
                 layer.place()
