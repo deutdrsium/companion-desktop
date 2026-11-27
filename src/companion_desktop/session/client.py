@@ -4,8 +4,10 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future
 from copy import deepcopy
 from math import ceil
+from threading import Thread
 from time import monotonic
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -153,7 +155,7 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class HttpTransport:
-    """POST to the authenticated plugin route using an injected existing credential."""
+    """POST to the authenticated plugin route without making exit wait for socket I/O."""
 
     def __init__(self, endpoint, credential, *, timeout=5):
         self.endpoint = endpoint
@@ -181,7 +183,19 @@ class HttpTransport:
         return result.get("data")
 
     async def __call__(self, operation, payload):
-        return await asyncio.to_thread(self._call, operation, payload)
+        result = Future()
+
+        def run():
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                result.set_result(self._call(operation, payload))
+            except Exception as error:
+                result.set_exception(error)
+
+        pending = asyncio.wrap_future(result)
+        Thread(target=run, daemon=True, name="desktop-session-http").start()
+        return await pending
 
 
 class DesktopSession(_SessionEvents):
@@ -230,12 +244,22 @@ class DesktopSession(_SessionEvents):
         self._wake.set()
         self.start()
 
-    async def close(self):
-        if self._runner is not None:
+    def request_close(self):
+        if not self._closing:
             self._closing = True
-            self.dispatcher.disconnect()
-            self._wake.set()
-            await self._runner
+            if self._runner is not None:
+                self._runner.cancel()
+
+    async def close(self):
+        self.request_close()
+        runner = self._runner
+        if runner is None:
+            return
+        try:
+            await asyncio.shield(runner)
+        except asyncio.CancelledError:
+            if not runner.cancelled():
+                raise
 
     def publish_capabilities(self, capabilities):
         body = deepcopy(capabilities)
@@ -320,7 +344,8 @@ class DesktopSession(_SessionEvents):
 
     async def _register(self):
         requested = self._permissions
-        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested)})
+        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested),
+                                                     "activate_on_exchange": True})
         if not fields(response, {"protocol": lambda item: item == PROTOCOL, "session": obj,
                                  "permissions": array(lambda item: item in PERMISSIONS)}):
             raise ProtocolError("invalid_response")
@@ -490,6 +515,9 @@ class DesktopSession(_SessionEvents):
                     continue
                 if not self._closing:
                     await self._wait(self._poll_interval)
+        except asyncio.CancelledError:
+            if not self._closing:
+                raise
         finally:
             if self.session is not None:
                 self.dispatcher.disconnect()
@@ -510,6 +538,6 @@ class DesktopSession(_SessionEvents):
 
     async def _best_effort_disconnect(self):
         try:
-            await self._exchange("disconnect")
-        except (ProtocolError, ConnectionError, TimeoutError):
+            await asyncio.wait_for(self._exchange("disconnect"), timeout=0.5)
+        except (ProtocolError, ConnectionError, TimeoutError, asyncio.TimeoutError):
             pass

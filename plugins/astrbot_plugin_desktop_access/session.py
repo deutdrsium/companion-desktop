@@ -17,6 +17,7 @@ from companion_desktop.contracts.wire import CLIENT_TYPES, ProtocolError, array,
 from companion_desktop.session.dispatcher import OutputResult, result_body, task_parameters, unavailable
 
 BATCH_LIMIT = 32
+PENDING_REGISTRATION_LIMIT = 8
 LEASE_SECONDS = 20
 TURN_TIMEOUT_SECONDS = 450
 TURN_STOP_GRACE_SECONDS = 4
@@ -114,6 +115,7 @@ class SessionHost:
         self.turn_timeout_seconds = turn_timeout_seconds
         self._claims = _Claims(turn_claims_path)
         self._connections = {}
+        self._pending_registrations = {}
         self._retired_receipts = OrderedDict()
         self._generation = 0
         self._turns = OrderedDict()
@@ -183,6 +185,7 @@ class SessionHost:
         return connection
 
     def revoke(self, device_id):
+        self._pending_registrations.pop(device_id, None)
         connection = self._connections.get(device_id)
         if connection is not None:
             key = connection.binding.key
@@ -192,27 +195,49 @@ class SessionHost:
                     self._stop_turn(turn)
 
     def _register(self, binding, payload):
-        if not fields(payload, {"protocols": array(string), "permissions": array(lambda item: item in PERMISSIONS)}):
+        if not fields(payload, {"protocols": array(string), "permissions": array(lambda item: item in PERMISSIONS)},
+                      {"activate_on_exchange": lambda value: value is True}):
             raise ProtocolError("invalid_request")
         protocol = negotiate(payload["protocols"])
         granted = binding.permissions & frozenset(payload["permissions"])
+        self._generation += 1
+        ref = {"device_id": binding.device_id, "desktop_session_id": uuid4().hex,
+               "generation": self._generation}
+        now = self.clock()
+        connection = _Connection(Binding(binding.device_id, binding.key, granted), ref, granted,
+                                 now + self.lease_seconds)
+        if payload.get("activate_on_exchange"):
+            pending = self._pending_registrations.setdefault(binding.device_id, {})
+            for generation, candidate in tuple(pending.items()):
+                if now >= candidate.expires:
+                    del pending[generation]
+            if len(pending) >= PENDING_REGISTRATION_LIMIT:
+                del pending[next(iter(pending))]
+            pending[ref["generation"]] = connection
+        else:
+            self._activate(connection)
+        return {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
+
+    def _activate(self, connection):
+        binding = connection.binding
         previous = self._connections.get(binding.device_id)
         if previous is not None:
             if previous.binding.key != binding.key:
                 self.revoke(binding.device_id)
             else:
                 self._retire(previous, "session_replaced")
-        if "speak" not in granted:
+        pending = self._pending_registrations.get(binding.device_id, {})
+        for generation in tuple(pending):
+            if generation <= connection.ref["generation"]:
+                del pending[generation]
+        if not pending:
+            self._pending_registrations.pop(binding.device_id, None)
+        if "speak" not in connection.permissions:
             for (key, _), turn in self._turns.items():
                 if key == binding.key:
                     self._stop_turn(turn)
-        self._generation += 1
-        ref = {"device_id": binding.device_id, "desktop_session_id": uuid4().hex,
-               "generation": self._generation}
-        connection = _Connection(Binding(binding.device_id, binding.key, granted), ref, granted, 0)
         self._connections[binding.device_id] = connection
         self._refresh(connection)
-        return {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
 
     def _update_capabilities(self, connection, body):
         current = connection.capabilities
@@ -551,10 +576,22 @@ class SessionHost:
         }) or max(len(payload["messages"]), len(payload["turns"])) > BATCH_LIMIT:
             raise ProtocolError("invalid_request")
         ref = parse_ref(payload["session"])
-        connection = self._bound(binding, ref)
         incoming = [parse(frame) for frame in payload["messages"]]
         if any(frame["session"] != ref or frame["type"] not in CLIENT_TYPES for frame in incoming):
             raise ProtocolError("invalid_message_direction_or_session")
+        pending = self._pending_registrations.get(binding.device_id, {})
+        candidate = pending.get(ref["generation"])
+        if candidate is not None and candidate.ref == ref and candidate.binding.key == binding.key:
+            if self.clock() < candidate.expires and operation == "exchange":
+                candidate.permissions &= binding.permissions
+                self._activate(candidate)
+            else:
+                del pending[ref["generation"]]
+                if not pending:
+                    self._pending_registrations.pop(binding.device_id, None)
+                if operation == "disconnect":
+                    return None
+        connection = self._bound(binding, ref)
         replies = []
         requested = set(payload["turns"])
         for frame in incoming:

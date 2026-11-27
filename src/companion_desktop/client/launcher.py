@@ -209,6 +209,8 @@ class Launch(QObject):
         self.card.hide()
 
     def shutdown(self):
+        if self.controller is not None and not self.controller.quitting:
+            self.controller.quit()
         if self.link is not None:
             self.link.close()
         if self.subtitles is not None:
@@ -259,8 +261,10 @@ def main(argv=None):
             launch.begin(cfg, character)
         return app.exec_()
     finally:
-        launch.shutdown()
-        lock.release()
+        try:
+            launch.shutdown()
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":
