@@ -34,6 +34,37 @@ Reconnect after a host-side grant change to register a fresh session.
 The wheel includes `astrbot_plugin_desktop_access.session` and the shared session
 contract for host integrations that install the wheel into their runtime.
 
+### Shared media
+
+Set `shared_media_enabled` to `true` in local client config alongside
+`server.device_session`. The host must also enable shared media and grant `speak`.
+The controller then exposes `Controller.shared_media`. A user action must call
+`start(source, kind)` for each shared session. `stop()` ends sharing. Playback
+controls continue to belong to the selected player.
+
+- `sources` and `sources_changed` provide local source choices. Call `refresh_sources()`
+  to enumerate Windows media sessions and `select_system(id)` to follow one.
+- `load_local(path, timed_text=None)` loads a local file. Use
+  `local_player.player` for play, pause, volume and `setVideoOutput(widget)`.
+  Call `seek_local(position_ms)` for seeks and `set_timed_text(path_or_none)` to select
+  an SRT or LRC for the current item from either source.
+- `start("local_player" | "system_media", "music" | "movie", genre=None, synopsis=None)`
+  takes optional user-supplied context for the first item. `current_item` and
+  `item_changed` expose the live snapshot, including `position_ms` and `duration_ms`
+  when available. They are `None` when no item is shared.
+- `state` and `state_changed` carry `shared_media.state`. `reaction` carries
+  `shared_media.reaction` once the reply has passed local checks. The controller
+  already presents those reactions using the existing speech and subtitle output.
+  `reaction_cancelled` carries the stale or interrupted `reaction_id`.
+- `tier` carries `shared_media.tier` with `tier` (`L0`, `L1` or `L2`), `cue` and
+  `strength`. `error` carries a reason string. `mark_credits()` and
+  `set_owner_speaking(active)` accept local cues. The existing opt-in headset
+  input drives owner-speech cues during a shared movie.
+
+Local audio levels come from the player's audio probe. Windows media sessions
+provide playback metadata. Shared snapshots contain named metadata, timing and
+numeric levels, and a comment may include one current timed-text line.
+
 Tests run offscreen: `QT_QPA_PLATFORM=offscreen python -m pytest`.
 `tools/render_states.py OUT_DIR` renders every panel state with placeholder text.
 

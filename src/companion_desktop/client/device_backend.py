@@ -1,6 +1,7 @@
 """Adapt the P1 device session to the existing Qt desktop controller."""
 
 import asyncio
+import json
 import logging
 import sys
 from threading import Thread
@@ -13,6 +14,7 @@ from ..avatar.model_catalog import load_mapping
 from ..avatar.motion import FRAME_PERIOD, cursor_offset
 from ..avatar.procedural import ProceduralAvatar
 from ..avatar.vts import VTSOutput
+from ..contracts.wire import ProtocolError
 from ..session.client import DesktopSession, HttpTransport
 from .legacy_backend import LegacyBackend
 
@@ -81,6 +83,15 @@ class DeviceBackend(LegacyBackend):
         self.transport = None
         self.session = DesktopSession(self._transport, permissions=("speak", "avatar") if self.avatar else ("speak",),
                                       avatar=self.avatar)
+        self.shared_media = None
+        self.media_transport = None
+        if cfg.get("shared_media_enabled") is True:
+            from .shared_media import SharedMedia
+
+            self.shared_media = SharedMedia(self.loop, self._shared_media_request,
+                                            lambda: self.session.granted_session("speak"), self)
+            if self.avatar is not None:
+                self.shared_media.tier.connect(self._media_pose)
         self.session.subscribe(self._event)
 
     async def _transport(self, operation, payload):
@@ -89,6 +100,20 @@ class DeviceBackend(LegacyBackend):
             # Allow for multi-second stalls on the host event loop.
             self.transport = HttpTransport(endpoint, self.key, timeout=30)
         return await self.transport(operation, payload)
+
+    async def _shared_media_request(self, operation, ref, payload):
+        endpoint = self.base + self.api + "/shared-media"
+        if self.media_transport is None or self.media_transport.endpoint != endpoint:
+            self.media_transport = HttpTransport(endpoint, self.key, timeout=12)
+        data = json.dumps({"operation": operation, "session": ref, "payload": payload},
+                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(data) > 8192:
+            raise ProtocolError("invalid_request")
+        return await self.media_transport.request(data)
+
+    def _media_pose(self, event):
+        if event["tier"] == "L0":
+            self.avatar.set_media_pose(event["cue"], event["strength"])
 
     def _publish(self):
         self.revision += 1
@@ -175,6 +200,8 @@ class DeviceBackend(LegacyBackend):
 
     def _event(self, event):
         kind = event["type"]
+        if self.shared_media is not None and kind in {"connection", "capabilities"}:
+            self.shared_media.session_changed()
         if kind == "connection":
             if self.avatar is not None:
                 self._update_avatar_output()
@@ -269,6 +296,8 @@ class DeviceBackend(LegacyBackend):
 
             async def finish():
                 try:
+                    if self.shared_media is not None:
+                        await self.shared_media.close()
                     await self.session.close()
                 finally:
                     await asyncio.gather(*self.tasks, return_exceptions=True)

@@ -69,6 +69,7 @@ class Motion:
         self.thinking = False
         self.reply_smile_until = 0.0
         self.mouth_target = 0.0
+        self.media_pose = ("neutral", 0)
         self._gaze = (0.0, 0.0)
         self._weight_shift = 0.0
         self._next_gaze = self._delay(1.0, 1.4)
@@ -110,6 +111,7 @@ class Motion:
 
     def clear_reflexes(self):
         self.typing = self.thinking = False
+        self.media_pose = ("neutral", 0)
         self.reply_smile_until = 0.0
         self._reflex = self._last_pointer = self._follow = None
         self.stop_mouth()
@@ -240,6 +242,19 @@ class Motion:
         if tilt is not None:
             phase = unit((now - tilt.started) / tilt.duration)
             targets["head_roll"] += 7.0 * tilt.strength * sin(phase * pi) ** 2
+
+        media_cue, media_strength = self.media_pose
+        if not (self.thinking or self.typing or self.mouth_target or laugh or nod or tilt):
+            if media_cue == "nod":
+                targets["head_pitch"] -= media_strength * (1 + sin(4.8 * t))
+            elif media_cue == "lean_in":
+                targets["head_pitch"] -= 3.0 * media_strength
+                targets["body_roll"] += media_strength
+            elif media_cue == "smile":
+                targets["mouth_form"] += media_strength * (1 - targets["mouth_form"])
+            elif media_cue == "solemn":
+                targets["mouth_form"] -= 0.4 * media_strength
+                targets["head_pitch"] -= media_strength
 
         if self._reflex is not None:
             start, duration, gaze, rise, fall = self._reflex

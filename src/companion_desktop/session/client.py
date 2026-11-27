@@ -163,8 +163,7 @@ class HttpTransport:
         self.timeout = timeout
         self._opener = build_opener(_NoRedirect())
 
-    def _call(self, operation, payload):
-        data = encode_request(operation, payload)
+    def _call(self, data):
         req = Request(self.endpoint, data=data,
                       headers={"Authorization": "Bearer " + self._credential, "Content-Type": "application/json"})
         try:
@@ -183,13 +182,16 @@ class HttpTransport:
         return result.get("data")
 
     async def __call__(self, operation, payload):
+        return await self.request(encode_request(operation, payload))
+
+    async def request(self, data):
         result = Future()
 
         def run():
             if not result.set_running_or_notify_cancel():
                 return
             try:
-                result.set_result(self._call(operation, payload))
+                result.set_result(self._call(data))
             except Exception as error:
                 result.set_exception(error)
 
@@ -228,6 +230,12 @@ class DesktopSession(_SessionEvents):
     @property
     def device_capabilities(self):
         return deepcopy(self._local_caps)
+
+    def granted_session(self, permission):
+        if (permission in self._grant and self._connection["state"] == "connected"
+                and not self._closing and not self._reconfigure):
+            return self.session
+        return None
 
     def capabilities_published(self, revision):
         return self.session is not None and self._published_revision == revision

@@ -294,6 +294,11 @@ class ProceduralAvatar:
         self._sync_model()
         self.motion.typing = bool(active)
 
+    def set_media_pose(self, cue, strength):
+        self._sync_model()
+        self._revision += 1
+        self.motion.media_pose = cue, strength
+
     def mouth_level(self, level):
         """P3 supplies a normalized envelope of the currently playing clip."""
         self._sync_model()

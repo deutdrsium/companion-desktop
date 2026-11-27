@@ -26,6 +26,7 @@
     "token_file": ""
   },
   "headset_barge_in": false,
+  "shared_media_enabled": false,
   "avatar": {
     "mapping": "",
     "port": 8001,
