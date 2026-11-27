@@ -1,12 +1,13 @@
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from companion_desktop.client import shared_media
-from companion_desktop.client.media_sources import MediaItem, TimedText
+from companion_desktop.client.media_sources import MediaItem, SystemMedia, TimedText
 
 
 REF = {"device_id": "device", "desktop_session_id": "session", "generation": 1}
@@ -280,6 +281,21 @@ def test_timed_text_tracks_overlaps_gaps_and_credits(tmp_path):
     assert timeline.context(4000) == ("Long line", 0, False)
     assert timeline.context(6500) == (None, 1500, False)
     assert timeline.context(8500) == ("[End credits]", 0, True)
+
+
+def test_system_stop_only_marks_end_with_timeline_evidence():
+    timeline = SimpleNamespace(start_time=timedelta(), end_time=timedelta(minutes=8),
+                               position=timedelta(minutes=2), last_updated_time=datetime.now(timezone.utc))
+    source = SystemMedia()
+    source.sessions["selection"] = SimpleNamespace(
+        get_playback_info=lambda: SimpleNamespace(playback_status=SimpleNamespace(name="STOPPED")),
+        get_timeline_properties=lambda: timeline,
+    )
+    props = SimpleNamespace(title="Example film", artist="", album_title="", track_number=0)
+    item = source.readback("selection", props)
+    assert item.status == "paused" and not item.ended
+    timeline.position = timeline.end_time - timedelta(milliseconds=500)
+    assert source.readback("selection", props).ended
 
 
 def test_shared_media_http_uses_existing_authenticated_transport(monkeypatch):

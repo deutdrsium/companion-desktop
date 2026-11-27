@@ -268,6 +268,8 @@ class SystemMedia:
                 if duration is not None:
                     position = min(position, duration)
         artist, album = wire_text(props.artist, 120), wire_text(props.album_title, 120)
+        ended = (status == "STOPPED" and position is not None and duration is not None
+                 and duration - position <= 750)
         return MediaItem((token, title, artist, album, props.track_number), title,
                          "playing" if status == "PLAYING" else "paused", position, duration,
-                         artist, album, ended=status == "STOPPED", timeline_key=stamp)
+                         artist, album, ended=ended, timeline_key=stamp)
