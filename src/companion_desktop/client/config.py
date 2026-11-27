@@ -20,6 +20,7 @@ DEFAULTS = {
     "account": {"username": "", "session_id": "", "keyring_service": "CompanionDesktop"},
     "subtitle": {"enabled": True, "port": 18676, "token_file": ""},
     "headset_barge_in": False,
+    "shared_media_enabled": False,
     "avatar": {"mapping": "", "port": 8001, "inputs": ["head_yaw", "head_pitch", "head_roll", "mouth_open", "mouth_form",
                                                           "eye_smile", "eye_left", "eye_right", "look_x", "look_y",
                                                           "brow_left", "brow_right"]},
