@@ -261,8 +261,10 @@ def main(argv=None):
             launch.begin(cfg, character)
         return app.exec_()
     finally:
-        launch.shutdown()
-        lock.release()
+        try:
+            launch.shutdown()
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":

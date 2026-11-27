@@ -239,9 +239,9 @@ class LegacyBackend(QObject):
         with self.sync_condition:
             self.sync_condition.notify_all()
 
-    def _end_screen(self, generation):
+    def _end_screen(self, generation, *, timeout=(0.5, 2)):
         try:
             self._request(self.api + "/screen", payload={"action": "end", "generation": generation,
-                                                          "session": self.screen_session}, timeout=(0.5, 2))
+                                                          "session": self.screen_session}, timeout=timeout)
         except Exception:
             pass

@@ -344,7 +344,8 @@ class DesktopSession(_SessionEvents):
 
     async def _register(self):
         requested = self._permissions
-        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested)})
+        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested),
+                                                     "activate_on_exchange": True})
         if not fields(response, {"protocol": lambda item: item == PROTOCOL, "session": obj,
                                  "permissions": array(lambda item: item in PERMISSIONS)}):
             raise ProtocolError("invalid_response")

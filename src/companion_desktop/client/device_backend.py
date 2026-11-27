@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 from threading import Thread
+from time import monotonic
 
 from PyQt5.QtCore import QTimer, pyqtSignal
 
@@ -16,6 +17,7 @@ from ..session.client import DesktopSession, HttpTransport
 from .legacy_backend import LegacyBackend
 
 log = logging.getLogger(__name__)
+SCREEN_END_GRACE_SECONDS = 1.25
 
 
 def _vts_cursor(model_position):
@@ -257,6 +259,10 @@ class DeviceBackend(LegacyBackend):
         self.timer.stop()
         self.cursor_timer.stop()
         self.session.request_close()
+        deadline = monotonic() + SCREEN_END_GRACE_SECONDS
+        worker = Thread(target=self._end_screen, args=(generation,), daemon=True, name="screen-end",
+                        kwargs={"timeout": (SCREEN_END_GRACE_SECONDS, SCREEN_END_GRACE_SECONDS)})
+        worker.start()
         if not self.loop.is_closed():
             for task in self.tasks:
                 task.cancel()
@@ -269,6 +275,4 @@ class DeviceBackend(LegacyBackend):
 
             self.loop.run_until_complete(finish())
             self.loop.close()
-        worker = Thread(target=super()._end_screen, args=(generation,), daemon=True, name="screen-end")
-        worker.start()
-        worker.join(timeout=0.5)
+        worker.join(timeout=max(0, deadline - monotonic()))
