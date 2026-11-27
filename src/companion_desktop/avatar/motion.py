@@ -7,6 +7,10 @@ from random import Random
 FRAME_PERIOD = 1 / 30
 STEP = 1 / 120
 PAUSE_GAP = 0.5
+BLINK_CLOSE = 0.065
+BLINK_HOLD = 0.065
+BLINK_OPEN = 0.12
+BLINK_DURATION = BLINK_CLOSE + BLINK_HOLD + BLINK_OPEN
 
 NEUTRAL = {
     "head_yaw": 0.0, "head_pitch": 0.0, "head_roll": 0.0,
@@ -69,8 +73,7 @@ class Motion:
         self._weight_shift = 0.0
         self._next_gaze = self._delay(1.0, 1.4)
         self._next_shift = self._delay(25.0, 30.0)
-        self._blink_start = self._delay(1.5, 2.0)
-        self._blink_length = 0.22
+        self._schedule_blink()
         self._lid = 1.0
         self._reflex = None
         self._last_pointer = None
@@ -79,6 +82,9 @@ class Motion:
 
     def _delay(self, minimum, mean):
         return minimum + self._random.expovariate(1 / mean)
+
+    def _schedule_blink(self):
+        self._blink_start = self.time + self._random.uniform(2.8, 5.5)
 
     def pointer(self, position):
         """Accept window-relative coordinates with positive X right and Y down."""
@@ -96,7 +102,6 @@ class Motion:
 
     def blink(self):
         self._blink_start = self.time
-        self._blink_length = 0.22 + 0.14 * self._life[1]
 
     def stop_mouth(self):
         self.mouth_target = 0.0
@@ -111,7 +116,7 @@ class Motion:
     def reset_pose(self):
         self.values = NEUTRAL.copy()
         self._lid = 1.0
-        self._blink_start = self.time + self._delay(1.5, 2.0)
+        self._schedule_blink()
         self._next_click = self.time
 
     def advance(self, elapsed, now, gestures):
@@ -119,7 +124,8 @@ class Motion:
             self._remaining = 0.0
             self._reflex = self._last_pointer = self._follow = None
             self.reply_smile_until = 0.0
-            self._blink_start = self.time + self._delay(1.5, 2.0)
+            self._lid = 1.0
+            self._schedule_blink()
             self.stop_mouth()
             return self._frame()
 
@@ -162,14 +168,14 @@ class Motion:
         if t >= self._next_shift:
             self._weight_shift = self._random.uniform(-0.9, 0.9)
             self._next_shift = t + self._delay(25.0, 30.0)
-        if t >= self._blink_start + self._blink_length:
-            self._blink_start = t + self._delay(1.7, 2.0)
-            self._blink_length = 0.22 + 0.14 * fatigue
-        phase = (t - self._blink_start) / self._blink_length
-        if 0 <= phase < 1:
-            self._lid = 1 - ease(phase / 0.30) if phase < 0.30 else ease((phase - 0.50) / 0.50)
+        blink_age = t - self._blink_start
+        if blink_age >= BLINK_DURATION:
+            self._schedule_blink()
+        if 0 <= blink_age < BLINK_DURATION:
+            self._lid = (1 - ease(blink_age / BLINK_CLOSE) if blink_age < BLINK_CLOSE
+                         else ease((blink_age - BLINK_CLOSE - BLINK_HOLD) / BLINK_OPEN))
         else:
-            self._lid = follow(self._lid, 1.0, 22.0, STEP)
+            self._lid = 1.0
 
         sway = (1 + 0.35 * happiness) * (1 - 0.34 * fatigue)
         targets = {
@@ -180,7 +186,7 @@ class Motion:
             "body_roll": 0.45 * sway * sin(0.29 * t + 0.5) + 0.5 * self._weight_shift,
             "breath": 0.50 - 0.42 * cos(1.38 * t),
             "look_x": self._gaze[0], "look_y": self._gaze[1] - 0.39 * reading - 0.12 * fatigue,
-            "eye_left": 1 - 0.22 * fatigue, "eye_right": 1 - 0.22 * fatigue,
+            "eye_left": 1.0, "eye_right": 1.0,
             "brow_left": -0.14 * fatigue, "brow_right": -0.14 * fatigue,
             "eye_smile": 0.17 * happiness, "mouth_form": 0.26 * happiness,
             "mouth_open": self.mouth_target,
