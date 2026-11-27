@@ -329,6 +329,7 @@ class StateAvatar(Animated):
     def __init__(self, character, state="idle", size=46, parent=None):
         super().__init__(parent)
         self.character, self.state, self.phase, self.level = character, state, 0.25, 0.0
+        self.source = None   # PlaybackLevel-like: get() -> live level, or None when unavailable
         self.setFixedSize(size, size)
         self.setAccessibleName((character.name if character else "") + " 状态")
 
@@ -343,8 +344,10 @@ class StateAvatar(Animated):
 
     def tick(self, ms):
         self.phase = (ms % 1400) / 1400.0
-        if self.state == "speaking" and self.level <= 0:
-            self.level = 0.35 + 0.25 * math.sin(ms / 180.0)  # placeholder until P2/P3 send the envelope
+        if self.state == "speaking":
+            live = self.source.get() if self.source is not None else None
+            # The sine only fills in when playback reports no level (e.g. VTS drives the mouth).
+            self.level = live if live is not None else 0.35 + 0.25 * math.sin(ms / 180.0)
         self.update()
 
     def paintEvent(self, _):
@@ -414,13 +417,14 @@ class Dot(QWidget):
 
 
 class Waveform(Animated):
-    """Speaking level bars. U1 animates a placeholder; U2 feeds the shared RMS envelope."""
+    """Speaking level bars: scroll the shared playback level, or a placeholder without one."""
 
     def __init__(self, color=None, bars=14, parent=None):
         super().__init__(parent)
         self.color = QColor(color or C["accent"])
         self.levels = [0.3 + 0.55 * abs(math.sin(i * 0.9)) for i in range(bars)]  # still frame
         self.envelope = None
+        self.source = None   # PlaybackLevel-like: get() -> live level, or None when unavailable
         self.setFixedSize(bars * 4 + 2, 18)
         self.animate(True)
 
@@ -430,6 +434,10 @@ class Waveform(Animated):
         self.update()
 
     def tick(self, ms):
+        live = self.source.get() if self.source is not None else None
+        if live is not None:
+            self.push(live)
+            return
         if self.envelope is None:
             n = len(self.levels)
             self.levels = [0.25 + 0.6 * abs(math.sin(ms / 230.0 + i * 0.7)) * (0.6 + 0.4 * math.sin(ms / 510.0 + i))

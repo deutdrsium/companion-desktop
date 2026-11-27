@@ -5,6 +5,7 @@ import io
 from math import sqrt
 import re
 import sys
+from time import monotonic
 import wave
 
 
@@ -51,6 +52,33 @@ def wav_levels(content):
             return tuple(levels)
     except (wave.Error, EOFError, ValueError):
         return ()
+
+
+class PlaybackLevel:
+    """Latest playback level for painted widgets; decays to idle once updates stop.
+
+    The player writes and the UI clock reads. The sample is one tuple swapped in a
+    single assignment, so the two sides need no lock. ``get()`` is None until a real
+    level has arrived, which lets widgets keep their placeholder motion.
+    """
+
+    HOLD_MS = 2 * LEVEL_INTERVAL_MS + 60   # survive a missed player notification
+    DECAY_MS = 260
+
+    def __init__(self, clock=monotonic):
+        self._clock = clock
+        self._sample = None
+
+    def set(self, level):
+        self._sample = (min(1.0, max(0.0, float(level))), self._clock())
+
+    def get(self):
+        sample = self._sample
+        if sample is None:
+            return None
+        level, at = sample
+        age = (self._clock() - at) * 1000.0 - self.HOLD_MS
+        return level if age <= 0 else level * max(0.0, 1.0 - age / self.DECAY_MS)
 
 
 class CueTrack:

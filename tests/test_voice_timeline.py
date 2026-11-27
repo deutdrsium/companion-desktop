@@ -161,6 +161,8 @@ def test_b04_b05_send_audio_barge_in_text_and_fail(qapp, prefs, tmp_path, stream
         assert not controller.gestures
         player.progress.emit(clip, 315, 0.29)
         assert len(controller.gestures) == 1 and rig.avatar.motion.mouth_target > 0
+        assert controller.level.get() > 0 and controller.panel.header.avatar.source is controller.level
+        assert replies(controller)[-1].wave.source is controller.level
         backend.loop.run_until_complete(rig.frames(4))
         assert rig.vts.frames[-1]["mouth_open"] > 0 and rig.avatar.motion.values["head_pitch"] < 0
         player.paused.emit()
