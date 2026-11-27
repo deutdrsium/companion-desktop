@@ -48,9 +48,8 @@ controls continue to belong to the selected player.
   `local_player.player` for play, pause, volume and `setVideoOutput(widget)`.
   Call `seek_local(position_ms)` for seeks and `set_timed_text(path_or_none)` to select
   an SRT or LRC for the current item from either source.
-- `start("local_player" | "system_media", "music" | "movie", genre=None, synopsis=None)`
-  takes optional user-supplied context for the first item. `current_item` and
-  `item_changed` expose the live snapshot, including `position_ms` and `duration_ms`
+- `start("local_player" | "system_media", "music" | "movie")` selects a source and kind.
+  `current_item` and `item_changed` expose the live snapshot, including `position_ms` and `duration_ms`
   when available. They are `None` when no item is shared.
 - `state` and `state_changed` carry `shared_media.state`. `reaction` carries
   `shared_media.reaction` once the reply has passed local checks. The controller
@@ -61,9 +60,10 @@ controls continue to belong to the selected player.
   `set_owner_speaking(active)` accept local cues. The existing opt-in headset
   input drives owner-speech cues during a shared movie.
 
-Local audio levels come from the player's audio probe. Windows media sessions
-provide playback metadata. Shared snapshots contain named metadata, timing and
-numeric levels, and a comment may include one current timed-text line.
+Shared snapshots contain a sanitized title, media kind, source, playback status and
+timing. Local audio contributes numeric RMS levels. Only Windows music sessions can
+include an artist. A comment may include one current timed-text line with links,
+domains and email addresses removed.
 
 Tests run offscreen: `QT_QPA_PLATFORM=offscreen python -m pytest`.
 `tools/render_states.py OUT_DIR` renders every panel state with placeholder text.

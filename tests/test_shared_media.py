@@ -2,12 +2,14 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+from threading import Event, get_ident
+from time import sleep
 from types import SimpleNamespace
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 from companion_desktop.client import shared_media
-from companion_desktop.client.media_sources import MediaItem, SystemMedia, TimedText
+from companion_desktop.client.media_sources import LocalPlayer, MediaItem, SystemMedia, TimedText
 
 
 REF = {"device_id": "device", "desktop_session_id": "session", "generation": 1}
@@ -81,6 +83,26 @@ class MediaHost:
         return {"state": self.state.copy(), "reaction": None}
 
 
+class SystemSource:
+    item = MediaItem("first", "First", "playing", None, None, artist="Demo artist")
+
+    async def discover(self):
+        return ({"id": "choice", "label": "Synthetic player"},)
+
+    def watch(self, token, notify):
+        assert token == "choice"
+        self.notify = notify
+
+    def unwatch(self):
+        pass
+
+    def close(self):
+        pass
+
+    async def snapshot(self, token):
+        return self.item
+
+
 async def settle():
     for _ in range(8):
         await asyncio.sleep(0)
@@ -94,13 +116,13 @@ def test_reconcile_heartbeat_track_change_and_permission_revocation(qapp, monkey
         host.lose_start = True
         clock, grant = [10], [REF]
         media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: grant[0], clock=lambda: clock[0])
-        media.local_player.set_item(artist="Public artist", album=r"C:\private\album", position_ms=10_000)
-        assert media.start("local_player", "music", genre="Jazz", synopsis="A https://example.test/private link")
+        media.local_player.set_item(artist="Embedded artist", position_ms=10_000)
+        assert media.start("local_player", "music")
         await settle()
         assert [operation for operation, _ in host.calls] == ["start", "status", "update"]
         request = host.calls[0][1]["media"]
         assert request == {"kind": "music", "source": "local_player", "status": "playing", "title": "First",
-                           "position_ms": 10_000, "duration_ms": 90_000, "artist": "Public artist", "genre": "Jazz"}
+                           "position_ms": 10_000, "duration_ms": 90_000}
         assert host.calls[-1][1]["media"]["loudness"] == 0.4
         clock[0] += 61
         media._tick()
@@ -217,26 +239,6 @@ def test_movie_pause_owner_and_credits_send_comments_without_new_fields(qapp, mo
 
 def test_system_media_without_position_only_comments_at_observed_track_change(qapp, monkeypatch):
     monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
-
-    class SystemSource:
-        sessions = {"choice": object()}
-        item = MediaItem("first", "First", "playing", None, None, "Demo artist", "Demo album")
-
-        async def discover(self):
-            return ({"id": "choice", "label": "Synthetic player"},)
-
-        def watch(self, token, notify):
-            assert token == "choice"
-
-        def unwatch(self):
-            pass
-
-        async def snapshot(self, token):
-            return self.item
-
-        def cached_snapshot(self, token):
-            return self.item
-
     monkeypatch.setattr(shared_media, "SystemMedia", SystemSource)
 
     async def run():
@@ -255,7 +257,7 @@ def test_system_media_without_position_only_comments_at_observed_track_change(qa
         await settle()
         assert [operation for operation, _ in host.calls] == ["start", "update"]
         assert host.state["position_ms"] is None and host.state["duration_ms"] is None
-        assert host.state["artist"] == "Demo artist" and host.state["album"] == "Demo album"
+        assert host.state["artist"] == "Demo artist" and "album" not in host.state
         media._system.item = replace(media._system.item, key="second", title="Second")
         media._tick()
         await settle()
@@ -264,6 +266,141 @@ def test_system_media_without_position_only_comments_at_observed_track_change(qa
         host.reply.set()
         await settle()
         assert events == []
+        await media.close()
+
+    asyncio.run(run())
+
+
+def test_windows_timeline_jump_cancels_held_reaction_and_advances_seq(qapp, monkeypatch):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    monkeypatch.setattr(shared_media, "SystemMedia", SystemSource)
+
+    async def run():
+        clock = [0]
+        host = MediaHost()
+        host.hold_comment = True
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: REF, clock=lambda: clock[0])
+        media.can_present = lambda: True
+        events = []
+        media.reaction.connect(events.append)
+        try:
+            media.refresh_sources()
+            await settle()
+            media.select_system("choice")
+            media._system.item = MediaItem("first", "First", "playing", 0, 90_000, timeline_key="first anchor")
+            assert media.start("system_media", "music")
+            await settle()
+            assert host.calls[-1][0] == "comment"
+            held_seq = host.state["seq"]
+            clock[0] = 0.2
+            media._system.item = replace(media._system.item, position_ms=200)
+            media._system_event("choice", "timeline")
+            await settle()
+            assert host.state["seq"] == held_seq
+            clock[0] = 0.4
+            media._system.item = replace(media._system.item, position_ms=600)
+            host.reply.set()
+            await settle()
+            assert host.state["seq"] > held_seq and host.state["position_ms"] == 600
+            assert events == []
+        finally:
+            await media.close()
+
+    asyncio.run(run())
+
+
+def test_windows_slow_native_getter_leaves_qt_timer_responsive(qapp):
+    started, finished = Event(), Event()
+    qt_thread = get_ident()
+    ticks = []
+    timer = QTimer(interval=10)
+    timer.timeout.connect(lambda: ticks.append(started.is_set() and not finished.is_set()))
+
+    def playback():
+        assert get_ident() != qt_thread
+        started.set()
+        sleep(0.3)
+        finished.set()
+        return SimpleNamespace(playback_status=SimpleNamespace(name="PAUSED"))
+
+    async def props():
+        return SimpleNamespace(title="Film", artist="", track_number=0)
+
+    async def read():
+        source = SystemMedia()
+        session = SimpleNamespace(get_playback_info=playback, get_timeline_properties=lambda: None,
+                                  try_get_media_properties_async=props)
+        source.manager = SimpleNamespace(get_sessions=lambda: (session,))
+        source.sessions["choice"] = session
+        task = asyncio.create_task(source.snapshot("choice"))
+        timer.start()
+        try:
+            while not task.done():
+                qapp.processEvents()
+                await asyncio.sleep(0.005)
+            assert (await task).title == "Film"
+        finally:
+            timer.stop()
+            source.close()
+
+    asyncio.run(asyncio.wait_for(read(), 3))
+    assert sum(ticks) >= 3
+
+
+def test_paused_subtitle_and_title_strip_links_and_addresses(qapp, monkeypatch, tmp_path):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    captions = tmp_path / "example.srt"
+    captions.write_text("1\n00:00:01,000 --> 00:00:05,000\n"
+                        "Stay here. youtu.be/demo https://example.org/path contact@example.org example.net\n",
+                        encoding="utf-8")
+
+    async def run():
+        host = MediaHost()
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: REF, clock=lambda: 0)
+        media.can_present = lambda: True
+        media.local_player.set_item(title="Demo podcast youtu.be/link email&#64;example.org", position_ms=2000)
+        media.set_timed_text(captions)
+        try:
+            assert media.start("local_player", "movie")
+            await settle()
+            media.local_player.set_item(status="paused")
+            await settle()
+            assert host.state["title"] == "Demo podcast"
+            assert host.calls[-1][0] == "comment"
+            assert host.calls[-1][1]["cue"] == "Stay here."
+        finally:
+            await media.close()
+
+    asyncio.run(run())
+
+
+def test_send_point_filters_snapshot_fields_and_local_reads_only_title(qapp, monkeypatch):
+    tags = []
+    player = SimpleNamespace(NoMedia=0, InvalidMedia=1, EndOfMedia=2, PlayingState=3, mediaStatus=lambda: 3,
+                             state=lambda: 3, duration=lambda: 1000, position=lambda: 150,
+                             metaData=lambda key: (tags.append(key), "Demo")[1])
+    source = SimpleNamespace(player=player, _key="local", _title="Fallback", _level_at=0, _level=0.3)
+    item = LocalPlayer.snapshot(source)
+    assert tags == ["Title"] and item.artist is None
+
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+
+    async def run():
+        captured = []
+
+        async def send(_, __, payload):
+            captured.append(payload["media"])
+
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), send, lambda: REF)
+        item = {"kind": "music", "source": "local_player", "title": "Demo", "status": "playing",
+                "position_ms": 150, "duration_ms": 1000, "loudness": 0.3, "artist": "Unknown",
+                "album": "Private album", "author": "Embedded author", "composer": "Embedded composer",
+                "comment": "Embedded comment", "genre": "Jazz", "synopsis": "Text", "scene_cut": True}
+        for source, kind in (("local_player", "music"), ("system_media", "movie"), ("system_media", "music")):
+            await media._send("update", REF, {"media_id": "media", "seq": 1,
+                                             "media": {**item, "source": source, "kind": kind}})
+        base = {"kind", "source", "title", "status", "position_ms", "duration_ms"}
+        assert [set(snapshot) for snapshot in captured] == [base | {"loudness"}, base, base | {"artist"}]
         await media.close()
 
     asyncio.run(run())
@@ -291,7 +428,7 @@ def test_system_stop_only_marks_end_with_timeline_evidence():
         get_playback_info=lambda: SimpleNamespace(playback_status=SimpleNamespace(name="STOPPED")),
         get_timeline_properties=lambda: timeline,
     )
-    props = SimpleNamespace(title="Example film", artist="", album_title="", track_number=0)
+    props = SimpleNamespace(title="Example film", artist="", track_number=0)
     item = source.readback("selection", props)
     assert item.status == "paused" and not item.ended
     timeline.position = timeline.end_time - timedelta(milliseconds=500)

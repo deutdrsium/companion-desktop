@@ -3,22 +3,30 @@
 import asyncio
 from array import array
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html import unescape
 from math import isfinite, sqrt
 from pathlib import Path
+from queue import SimpleQueue
 import re
 import sys
+from threading import Thread
 from time import monotonic
 from uuid import uuid4
 
-from PyQt5.QtCore import QObject, QUrl, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
 
 
 _LOCATION = re.compile(
-    r"(?:^|[\s(])(?:/|~[/\\]|\.{1,2}[/\\])|[a-z][a-z0-9+.-]*://|file:|\b[a-z]:[/\\]|\\\\|www\."
-    r"|[\w.-]+[/\\][\w.-]+\.[a-z0-9]{2,8}\b", re.I)
+    r"(?:^|[\s(])(?:/|~[/\\]|\.{1,2}[/\\])|file:|\b[a-z]:[/\\]|\\\\|[\w.-]+[/\\]", re.I)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+_HOST = r"(?:(?:[\w-]+\.)+(?:xn--[\w-]+|[^\W\d_]{2,63})|\b(?:\d{1,3}\.){3}\d{1,3}\b)"
+_LINK = re.compile(
+    rf"(?:[a-z][a-z0-9+.-]*://|mailto:)[^\s<>\[\]()，。；！？]+"
+    rf"|[\w.!#$%&'*+/=?^_`{{|}}~-]+@[\w.-]+"
+    rf"|{_HOST}(?::\d+)?(?:[/#?][^\s<>\[\]()，。；！？]*)?", re.I)
+_LINK_TRANSLATION = str.maketrans({"。": ".", "．": ".", "｡": ".", "＠": "@"})
 _SRT_TIME = r"(\d{2}:\d{2}:\d{2}[,.]\d{3})"
 _SRT_RANGE = re.compile(rf"(?m)^{_SRT_TIME}\s+-->\s+{_SRT_TIME}[^\n]*\n")
 _LRC_TIME = re.compile(r"\[(\d+:\d{2}(?:\.\d{1,3})?)\]")
@@ -28,7 +36,17 @@ _CREDITS = re.compile(r"^\[?(?:end credits|closing credits|片尾字幕|演职�
 def wire_text(value, limit):
     if not isinstance(value, str):
         return None
-    value = _CONTROL.sub(" ", value).strip()
+    value = _CONTROL.sub(" ", unescape(value)).strip()
+    links = _LINK.finditer(value.translate(_LINK_TRANSLATION))
+    start = 0
+    parts = []
+    for link in links:
+        parts.append(value[start:link.start()])
+        start = link.end()
+    parts.append(value[start:])
+    value = " ".join(" ".join(parts).split())
+    if start and not re.search(r"\w", value):
+        return None
     if value and not _LOCATION.search(value):
         return value[:limit]
     return None
@@ -92,7 +110,7 @@ class TimedText:
                 cue_index -= 1
             cue = self.cues[cue_index][2]
         gap_end = self.starts[index] if index < len(self.cues) else 2**53 - 1
-        return wire_text(cue, 300), 0 if active else gap_end - position, bool(
+        return cue, 0 if active else gap_end - position, bool(
             active and cue and _CREDITS.fullmatch(cue))
 
 
@@ -104,10 +122,11 @@ class MediaItem:
     position_ms: int | None
     duration_ms: int | None
     artist: str | None = None
-    album: str | None = None
     loudness: float | None = None
     ended: bool = False
     timeline_key: object = None
+    sampled_at: float | None = field(default=None, compare=False)
+    playback_rate: float = 1.0
 
 
 class LocalPlayer(QObject):
@@ -153,9 +172,7 @@ class LocalPlayer(QObject):
         return MediaItem(
             self._key, wire_text(player.metaData("Title"), 160) or self._title,
             "playing" if playing else "paused", duration if ended else position, duration,
-            wire_text(player.metaData("ContributingArtist"), 120) or wire_text(player.metaData("Author"), 120),
-            wire_text(player.metaData("AlbumTitle"), 120),
-            self._level if playing and monotonic() - self._level_at < 0.75 else None, ended,
+            loudness=self._level if playing and monotonic() - self._level_at < 0.75 else None, ended=ended,
         )
 
     def reset_level(self):
@@ -186,20 +203,71 @@ class LocalPlayer(QObject):
                 self._level_at = monotonic()
 
 
-class SystemMedia:
+class SystemMedia(QObject):
+    _completed = pyqtSignal(object, object, object)
+
     def __init__(self):
+        super().__init__()
         self.manager = None
         self.sessions = {}
-        self._cached = None
+        self._jobs = SimpleQueue()
+        self._worker = None
+        self._closed = False
+        self._selection = None
+        self._watched = None
         self._watch = []
+        self._completed.connect(self._finish, Qt.QueuedConnection)
+
+    @pyqtSlot(object, object, object)
+    def _finish(self, future, result, error):
+        if not future.done():
+            if error is None:
+                future.set_result(result)
+            else:
+                future.set_exception(error)
+
+    def _run(self):
+        uninitialize = None
+        try:
+            while (job := self._jobs.get()) is not None:
+                future, operation, args = job
+                result = error = None
+                try:
+                    if sys.platform == "win32" and uninitialize is None:
+                        from winrt.runtime import ApartmentType, init_apartment, uninit_apartment
+
+                        init_apartment(ApartmentType.MULTI_THREADED)
+                        uninitialize = uninit_apartment
+                    result = operation(*args)
+                except Exception as exc:
+                    error = exc
+                if future is not None and not self._closed:
+                    self._completed.emit(future, result, error)
+        finally:
+            self._unwatch()
+            self.sessions.clear()
+            self.manager = None
+            if uninitialize is not None:
+                uninitialize()
+
+    async def _submit(self, operation, *args):
+        if self._worker is None:
+            self._worker = Thread(target=self._run, name="system-media", daemon=True)
+            self._worker.start()
+        future = asyncio.get_running_loop().create_future()
+        self._jobs.put((future, operation, args))
+        return await future
 
     async def discover(self):
         if sys.platform != "win32":
             return ()
+        return await self._submit(lambda: asyncio.run(self._discover()))
+
+    async def _discover(self):
         from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
 
         if self.manager is None:
-            self.manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+            self.manager = await asyncio.wait_for(GlobalSystemMediaTransportControlsSessionManager.request_async(), 2)
         sessions = {}
         for session in self.manager.get_sessions():
             token = next((key for key, previous in self.sessions.items() if previous == session), None)
@@ -208,8 +276,15 @@ class SystemMedia:
         return tuple({"id": token, "label": session.source_app_user_model_id} for token, session in sessions.items())
 
     def watch(self, token, notify):
-        self.unwatch()
-        session = self.sessions[token]
+        self._selection = token, notify
+
+    def _watch_session(self, selection, session):
+        if self._watched == selection:
+            return
+        self._unwatch()
+        if selection is None:
+            return
+        token, notify = selection
         for add, remove, kind in ((session.add_media_properties_changed, session.remove_media_properties_changed,
                                    "media"),
                                   (session.add_playback_info_changed, session.remove_playback_info_changed,
@@ -218,29 +293,38 @@ class SystemMedia:
                                    "timeline")):
             event = add(lambda _, __, kind=kind: notify(token, kind))
             self._watch.append((remove, event))
+        self._watched = selection
 
     def unwatch(self):
+        self._selection = None
+        if self._worker is not None:
+            self._jobs.put((None, self._unwatch, ()))
+
+    def _unwatch(self):
         for remove, event in self._watch:
             try:
                 remove(event)
-            except OSError:
+            except (OSError, RuntimeError):
                 pass
         self._watch.clear()
-        self._cached = None
+        self._watched = None
+
+    def close(self):
+        self._closed = True
+        if self._worker is not None:
+            self._jobs.put(None)
 
     async def snapshot(self, token):
+        selection = self._selection
+        return await self._submit(lambda: asyncio.run(self._snapshot(token, selection)))
+
+    async def _snapshot(self, token, selection):
         session = self.sessions.get(token)
         if session is None or session not in self.manager.get_sessions():
-            self._cached = None
             return None
+        self._watch_session(selection if selection and selection[0] == token else None, session)
         props = await asyncio.wait_for(session.try_get_media_properties_async(), 1)
-        self._cached = token, props
         return self.readback(token, props)
-
-    def cached_snapshot(self, token):
-        if self._cached is None or self._cached[0] != token:
-            return None
-        return self.readback(token, self._cached[1])
 
     def readback(self, token, props):
         session = self.sessions.get(token)
@@ -248,11 +332,16 @@ class SystemMedia:
             return None
         info = session.get_playback_info()
         status = info.playback_status.name if info is not None else None
-        title = wire_text(props.title, 160)
-        if status not in {"PLAYING", "PAUSED", "STOPPED"} or not title:
+        raw_title = props.title.strip()
+        if status not in {"PLAYING", "PAUSED", "STOPPED"} or not raw_title:
             return None
+        title = wire_text(raw_title, 160) or "媒体"
         position = duration = stamp = None
         timeline = session.get_timeline_properties()
+        sampled_at = monotonic()
+        rate = getattr(info, "playback_rate", None) or 1
+        if not isfinite(rate):
+            rate = 1
         if timeline is not None:
             start, end = timeline.start_time, timeline.end_time
             duration = int((end - start).total_seconds() * 1000) if end > start else None
@@ -262,14 +351,13 @@ class SystemMedia:
                 if status == "PLAYING" and stamp.year > 1970:
                     stamp = stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
                     age = (datetime.now(timezone.utc) - stamp).total_seconds()
-                    rate = info.playback_rate or 1
-                    if isfinite(rate):
-                        position = max(0, position + int(1000 * max(0, age) * rate))
+                    position = max(0, position + int(1000 * max(0, age) * rate))
                 if duration is not None:
                     position = min(position, duration)
-        artist, album = wire_text(props.artist, 120), wire_text(props.album_title, 120)
+        raw_artist = props.artist
+        artist = wire_text(raw_artist, 120)
         ended = (status == "STOPPED" and position is not None and duration is not None
                  and duration - position <= 750)
-        return MediaItem((token, title, artist, album, props.track_number), title,
+        return MediaItem((token, raw_title, raw_artist, props.track_number), title,
                          "playing" if status == "PLAYING" else "paused", position, duration,
-                         artist, album, ended=ended, timeline_key=stamp)
+                         artist, ended=ended, timeline_key=stamp, sampled_at=sampled_at, playback_rate=rate)

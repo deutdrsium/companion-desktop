@@ -14,6 +14,7 @@ from .media_sources import LocalPlayer, SystemMedia, TimedText, wire_text
 SYNC_SECONDS = 60
 TRACK_GAP_SECONDS = 4
 MIN_GAP_MS = 1800
+SYSTEM_TIMELINE_DRIFT_MS = 150
 SESSION_ERRORS = {"unauthorized", "stale_session", "disabled", "unsupported_protocol"}
 RETRY_ERRORS = {"connection_lost", "stale_media", "stale_revision", "invalid_response"}
 
@@ -104,7 +105,7 @@ class SharedMedia(QObject):
         self._poll_system(discover=True)
 
     def select_system(self, source_id):
-        if source_id not in self._system.sessions:
+        if source_id not in {item["id"] for item in self._sources}:
             raise ValueError("unknown_media_source")
         if source_id != self._system_token:
             if self._armed and self._source == "system_media":
@@ -112,7 +113,7 @@ class SharedMedia(QObject):
             self._timeline = self._timeline_item = None
             self._system_token = source_id
 
-    def start(self, source, kind, *, genre=None, synopsis=None):
+    def start(self, source, kind):
         """Start after explicit user consent. The selected player keeps its own controls."""
         if source not in {"local_player", "system_media"} or kind not in {"music", "movie"}:
             raise ValueError("invalid_media_source_or_kind")
@@ -123,13 +124,11 @@ class SharedMedia(QObject):
             self.error.emit("unauthorized")
             return False
         if ((source == "local_player" and self.local_player.snapshot() is None)
-                or (source == "system_media" and self._system_token not in self._system.sessions)):
+                or (source == "system_media" and self._system_token not in {item["id"] for item in self._sources})):
             self.error.emit("no_media")
             return False
         if ref != self._ref:
             self._adopt_session(ref)
-        self._details = {key: clean for key, clean in
-                         (("genre", wire_text(genre, 80)), ("synopsis", wire_text(synopsis, 600))) if clean}
         self._source, self._kind, self._armed = source, kind, True
         self._item = None
         self._owner_speaking = False
@@ -153,6 +152,7 @@ class SharedMedia(QObject):
         self._armed = False
         self._desired_id = self._item = None
         self._seek_until = 0
+        self._system_pending = False
         self._timer.stop()
         self._system.unwatch()
         self.interrupt_reaction()
@@ -167,6 +167,7 @@ class SharedMedia(QObject):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._system.close()
 
     def session_changed(self):
         ref = self._granted_session()
@@ -224,7 +225,7 @@ class SharedMedia(QObject):
             self._read_local()
         else:
             self._poll_system(discover=False)
-        if self._speech is not None and not self._valid(*self._speech[1:]):
+        if self._speech is not None and not self._system_pending and not self._valid(*self._speech[1:]):
             self.interrupt_reaction()
         self._schedule_sync()
 
@@ -249,7 +250,7 @@ class SharedMedia(QObject):
         ref, token = self._ref, self._system_token
         try:
             if discover:
-                found = await asyncio.wait_for(self._system.discover(), 2)
+                found = await self._system.discover()
                 self._sources = tuple({**item, "source": "system_media"} for item in found)
                 self.sources_changed.emit(self.sources)
             if self._armed and self._source == "system_media":
@@ -263,24 +264,17 @@ class SharedMedia(QObject):
             if discover:
                 self.error.emit("system_media_unavailable")
             elif self._armed and ref == self._ref and token == self._system_token:
+                self._system_pending = False
                 self._observe(None)
 
     def _system_event(self, token, kind):
         if not self._armed or self._source != "system_media" or self._system_token != token:
             return
+        self._system_serial += 1
+        self._system_pending = True
         if kind == "media":
-            self._system_serial += 1
-            self._system_pending = True
             self.interrupt_reaction()
-            self._poll_system(discover=False)
-        elif not self._system_pending:
-            self._system_readback()
-
-    def _system_readback(self):
-        try:
-            self._observe(self._system.cached_snapshot(self._system_token))
-        except (OSError, RuntimeError):
-            self._observe(None)
+        self._poll_system(discover=False)
 
     def _observe(self, item):
         previous, self._item = self._item, item
@@ -288,16 +282,9 @@ class SharedMedia(QObject):
         changed = (previous.key if previous else None) != (item.key if item else None)
         paused = previous is not None and item is not None and previous.status != item.status
         seeked = False
-        if not changed and previous is not None and item is not None:
+        if not changed and not paused and previous is not None and item is not None:
             if item.position_ms is not None and previous.position_ms is not None:
-                elapsed_ms = (now - self._changed_at) * 1000
-                delta = item.position_ms - previous.position_ms
-                anchor_changed = (item.timeline_key is not None and previous.timeline_key is not None
-                                  and item.timeline_key != previous.timeline_key)
-                seeked = (delta < -250 or delta > max(1000, 2 * elapsed_ms + 500)
-                          or (previous.status == item.status == "paused" and abs(delta) > 30)
-                          or (anchor_changed and item.status == previous.status == "playing"
-                              and abs(delta - elapsed_ms) > 350))
+                seeked = self._seeked(previous, item, now)
         if changed or paused or seeked or (previous and item and item.ended != previous.ended):
             self.interrupt_reaction()
             self._dirty = True
@@ -307,8 +294,6 @@ class SharedMedia(QObject):
                 self._item_at = now
                 self._credits = False
                 self._hot_at = float("-inf")
-                if previous is not None:
-                    self._details = {}
                 self._desired_id = uuid4().hex if item else None
                 if item is None:
                     self._idle()
@@ -338,24 +323,61 @@ class SharedMedia(QObject):
             self.item_changed.emit(self.current_item)
         self._schedule_sync()
 
+    def _seeked(self, previous, item, now):
+        delta = item.position_ms - previous.position_ms
+        if item.status == "paused":
+            return abs(delta) > 30
+        elapsed_ms = (now - self._changed_at) * 1000
+        if self._source != "system_media":
+            return delta < -250 or delta > max(1000, 2 * elapsed_ms + 500)
+        if item.sampled_at is not None and previous.sampled_at is not None:
+            elapsed_ms = max(0, item.sampled_at - previous.sampled_at) * 1000
+        expected = previous.position_ms + elapsed_ms * previous.playback_rate
+        if item.duration_ms is not None:
+            expected = min(expected, item.duration_ms)
+        drift = item.position_ms - expected
+        anchor_changed = item.timeline_key != previous.timeline_key
+        return (delta < -30 or drift > SYSTEM_TIMELINE_DRIFT_MS
+                or (anchor_changed and drift < -SYSTEM_TIMELINE_DRIFT_MS))
+
     def _context(self):
         if self._item and self._timeline and self._timeline_item == self._item.key:
             return self._timeline.context(self._item.position_ms)
         return None, 0, False
 
-    def _snapshot(self, *, starting=False):
+    def _snapshot(self):
         item = self._item
         media = {"kind": self._kind, "source": self._source, "status": item.status, "title": item.title,
                  "position_ms": item.position_ms, "duration_ms": item.duration_ms}
-        for key, limit in (("artist", 120), ("album", 120)):
-            value = wire_text(getattr(item, key), limit)
-            if value:
-                media[key] = value
-        if starting:
-            media.update(self._details)
-        elif item.loudness is not None:
+        if item.artist is not None:
+            media["artist"] = item.artist
+        if item.loudness is not None:
             media["loudness"] = item.loudness
         return media
+
+    async def _send(self, operation, ref, payload):
+        wire = {} if operation == "status" else {key: payload[key] for key in ("media_id", "seq")}
+        if operation in ("start", "update"):
+            item = payload["media"]
+            media = {key: item[key] for key in ("kind", "source", "status")}
+            media["title"] = wire_text(item["title"], 160) or "媒体"
+            for key in ("position_ms", "duration_ms"):
+                value = item.get(key)
+                media[key] = value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+            if media["source"] == "system_media" and media["kind"] == "music":
+                artist = wire_text(item.get("artist"), 120)
+                if artist:
+                    media["artist"] = artist
+            if operation == "update" and media["source"] == "local_player":
+                level = item.get("loudness")
+                if type(level) in (int, float) and 0 <= level <= 1:
+                    media["loudness"] = level
+            wire["media"] = media
+        elif operation == "comment":
+            cue = wire_text(payload.get("cue"), 300)
+            if cue:
+                wire["cue"] = cue
+        return await self._request(operation, ref, wire)
 
     def _set_pose(self, cue, strength):
         if (cue, strength) != self._pose:
@@ -418,8 +440,6 @@ class SharedMedia(QObject):
     def allow_audio(self, reaction_id):
         if self._source == "local_player":
             self._read_local()
-        elif self._source == "system_media" and not self._system_pending:
-            self._system_readback()
         return (self._speech is not None and self._speech[0] == reaction_id
                 and self._valid(*self._speech[1:]))
 
@@ -468,7 +488,7 @@ class SharedMedia(QObject):
                 payload = {"media_id": self._remote_id}
             elif desired is not None and self._remote_id is None:
                 operation = "start"
-                payload = {"media_id": desired, "media": self._snapshot(starting=True)}
+                payload = {"media_id": desired, "media": self._snapshot()}
                 self._remote_id = desired
             elif desired is not None and (self._dirty or comment or (
                     self._comment_task is None and self._speech is None and self.clock() >= self._sync_at)):
@@ -479,7 +499,7 @@ class SharedMedia(QObject):
             if operation != "status":
                 self._seq += 1
                 payload["seq"] = self._seq
-            data = await self._request(operation, ref, payload)
+            data = await self._send(operation, ref, payload)
             if ref != self._ref or ref != self._granted_session():
                 return
             state = self._response_state(data)
@@ -529,15 +549,13 @@ class SharedMedia(QObject):
         try:
             if self._source == "local_player":
                 self._read_local()
-            elif not self._system_pending:
-                self._system_readback()
             if not self._valid(*context) or not self._eligible(tier, reason, at) or not self.can_present():
                 return
             cue, _, _ = self._context()
             payload = {"media_id": media_id, "seq": seq}
             if cue:
                 payload["cue"] = cue
-            data = await self._request("comment", ref, payload)
+            data = await self._send("comment", ref, payload)
             state = self._response_state(data)
             if state["media_id"] != media_id or state["seq"] != seq:
                 return
