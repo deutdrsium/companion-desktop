@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sys
+from threading import Thread
 
 from PyQt5.QtCore import QTimer, pyqtSignal
 
@@ -133,14 +134,19 @@ class DeviceBackend(LegacyBackend):
             self.tasks.append(asyncio.create_task(self._frames()))
 
     def load_history(self):
-        self.loop.create_task(self._start())
+        self.tasks.append(self.loop.create_task(self._start()))
         self.timer.start()
         if self.avatar:
             self.cursor_timer.start()
         super().load_history()
 
     def reconnect_session(self):
-        self.loop.call_soon(self.session.reconnect)
+        def reconnect():
+            if not self.closed:
+                self.session.reconnect()
+
+        if not self.closed:
+            self.loop.call_soon(reconnect)
 
     def _history_loaded(self, *_):
         self.history_ready = True
@@ -245,15 +251,24 @@ class DeviceBackend(LegacyBackend):
                                           rect.width(), rect.height()))
 
     def close(self, generation):
+        if self.closed:
+            return
+        self._stop_workers()
         self.timer.stop()
         self.cursor_timer.stop()
+        self.session.request_close()
         if not self.loop.is_closed():
+            for task in self.tasks:
+                task.cancel()
+
             async def finish():
-                for task in self.tasks:
-                    task.cancel()
-                await asyncio.gather(*self.tasks, return_exceptions=True)
-                await self.session.close()
+                try:
+                    await self.session.close()
+                finally:
+                    await asyncio.gather(*self.tasks, return_exceptions=True)
 
             self.loop.run_until_complete(finish())
             self.loop.close()
-        super().close(generation)
+        worker = Thread(target=super()._end_screen, args=(generation,), daemon=True, name="screen-end")
+        worker.start()
+        worker.join(timeout=0.5)

@@ -228,14 +228,20 @@ class LegacyBackend(QObject):
         threading.Thread(target=run, daemon=True, name="screen").start()
 
     def close(self, generation):
+        self._stop_workers()
+        self._end_screen(generation)
+
+    def _stop_workers(self):
+        self.closed = True
         if self.speech_stream is not None:
             self.disable_pcm()
+        self.speech_jobs.put((-1, 0, ""))
+        with self.sync_condition:
+            self.sync_condition.notify_all()
+
+    def _end_screen(self, generation):
         try:
             self._request(self.api + "/screen", payload={"action": "end", "generation": generation,
                                                           "session": self.screen_session}, timeout=(0.5, 2))
         except Exception:
             pass
-        self.closed = True
-        self.speech_jobs.put((-1, 0, ""))
-        with self.sync_condition:
-            self.sync_condition.notify_all()
