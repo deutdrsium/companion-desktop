@@ -7,7 +7,7 @@ from unittest.mock import patch
 from plugins.astrbot_plugin_desktop_access import session
 from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 from companion_desktop.contracts.types import PROTOCOL
-from companion_desktop.contracts.wire import MAX_REQUEST_BYTES, ProtocolError, encode_request, message
+from companion_desktop.contracts.wire import GAME_STATE_OFFER, MAX_REQUEST_BYTES, ProtocolError, encode_request, message
 from companion_desktop.session.client import DesktopSession
 from companion_desktop.session.dispatcher import Dispatcher, OutputResult
 
@@ -381,3 +381,91 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = host.handle(binding, "exchange", {"session": ref, "messages": [], "turns": []})
         self.assertEqual(result["messages"], [])
         self.assertEqual(host.receipt(ref, task["task_id"])["status"], "cancelled")
+
+    async def test_game_history_capacity_keeps_closed_windows_from_reopening(self):
+        binding = Binding("device-demo", "binding-demo", frozenset({"game"}))
+        host = SessionHost(clock=lambda: 1)
+        registration = {"protocols": [PROTOCOL, GAME_STATE_OFFER], "permissions": ["game"]}
+        ref = host.handle(binding, "register", registration)["session"]
+        accepted = []
+        snapshot = {"game": "stardew", "watering_tiles": [], "farmers": [
+            {"farmer_id": "1", "alias": "Farmer 1", "map": "Farm", "x": 1, "y": 1,
+             "is_host": True, "is_local": True},
+        ]}
+
+        def publish(game_id, seq=1, *, close=False):
+            game = {**CAPABILITIES["games"][0], "game_session_id": game_id}
+            state = {"game_session_id": game_id, "window_id": "window-demo", "window_revision": 1, "seq": seq,
+                     "snapshot": None if close else snapshot, "window_ttl_ms": 0 if close else 1000,
+                     "chat_events": [], "gap": False}
+            frames = [message("capabilities", ref, {**CAPABILITIES, "games": [game]}),
+                      message("game.state", ref, state)]
+            host.handle(binding, "exchange", {"session": ref, "messages": frames, "turns": []},
+                        on_message=accepted.append)
+
+        for index in range(64):
+            publish(f"game-demo-{index}")
+            publish(f"game-demo-{index}", seq=2, close=True)
+        self.assertEqual(len(accepted), 128)
+        publish("game-demo-64")
+        publish("game-demo-0")
+        publish("game-demo-0", seq=3)
+        self.assertEqual(len(accepted), 128)
+        self.assertEqual(host.send_intent(ref, {**GAME, "game_session_id": "game-demo-0"})["status"], "expired")
+
+        ref = host.handle(binding, "register", registration)["session"]
+        publish("game-demo-64")
+        self.assertEqual(len(accepted), 129)
+
+    async def test_revoke_game_keeps_speak_avatar_and_generation(self):
+        binding = Binding("device-demo", "binding-demo", frozenset({"speak", "avatar", "game"}))
+        chat, avatar, game = FakeChat(), FakeOutput(), FakeOutput(confirm_stop=False)
+        host, events = SessionHost(clock=lambda: 1), []
+
+        async def transport(operation, payload):
+            return host.handle(binding, operation, payload, turns=chat, snapshots=lambda _: [("wardrobe", WARDROBE)])
+
+        desktop = DesktopSession(transport, permissions=binding.permissions, avatar=avatar, game=game,
+                                 poll_interval=0.01, clock=lambda: 1)
+        self.addAsyncCleanup(desktop.close)
+        desktop.subscribe(events.append)
+        desktop.publish_capabilities(CAPABILITIES)
+        desktop.start()
+        await self.wait_for(lambda: desktop.connection["state"] == "connected")
+        ref = desktop.session
+        host.set_game_window(ref, "game-demo", "window-demo", 1, deadline=10)
+        desktop.set_game_window("game-demo", "window-demo", 1, deadline=10)
+        desktop.send_message("msg-demo", "Fixture message")
+        self.assertEqual(host.send_intent(ref, GAME)["status"], "queued")
+        self.assertEqual(host.send_intent(ref, AVATAR)["status"], "queued")
+        await self.wait_for(lambda: chat.calls and game.started and avatar.started)
+        self.assertEqual(host.send_intent(ref, {**GAME, "task_id": "queued-game"})["status"], "queued")
+        reserved = host.handle(binding, "register", {
+            "protocols": [PROTOCOL], "permissions": sorted(binding.permissions), "activate_on_exchange": True,
+        })["session"]
+
+        host.revoke_game(binding.device_id)
+        self.assertEqual(host.current_session(binding.device_id), ref)
+        self.assertEqual(host.receipt(ref, GAME["task_id"])["status"], "unknown")
+        self.assertEqual(host.receipt(ref, "queued-game")["status"], "cancelled")
+        self.assertEqual(host.send_intent(ref, {**GAME, "task_id": "post-revoke"})["reason_code"], "unauthorized")
+        self.assertEqual(host.capabilities(ref)["games"], [])
+        await self.wait_for(lambda: game.stopped)
+        self.assertEqual(game.stopped, [(GAME["task_id"], "unauthorized")])
+        self.assertEqual(len(game.started), 1)
+        self.assertEqual(avatar.stopped, [])
+        self.assertEqual(avatar.released, [])
+        self.assertEqual(len(avatar.snapshots), 1)
+        self.assertEqual(chat.cancelled, [])
+        self.assertTrue(desktop.capabilities["tts"])
+        self.assertTrue(desktop.capabilities["mouth"])
+        chat.result.set_result(TurnResult("completed", "Fixture reply"))
+        avatar.started[0][3](OutputResult("completed", evidence=EVIDENCE))
+        await self.wait_for(lambda: any(event["type"] == "turn.completed" for event in events))
+        await self.wait_for(lambda: host.receipt(ref, AVATAR["task_id"])["status"] == "completed")
+        self.assertEqual(desktop.session, ref)
+
+        response = host.handle(binding, "exchange", {"session": reserved, "messages": [], "turns": []})
+        self.assertEqual(response["permissions"], ["avatar", "speak"])
+        host.revoke(binding.device_id)
+        self.assertIsNone(host.current_session(binding.device_id))
