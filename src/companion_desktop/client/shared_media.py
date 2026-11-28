@@ -17,6 +17,9 @@ from .media_sources import LocalPlayer, SystemMedia, TimedText, wire_text
 SYNC_SECONDS = 60
 TRACK_GAP_SECONDS = 4
 MIN_GAP_MS = 1800
+MOVIE_SUBTITLE_GAP_MS = 3000
+MOVIE_MIN_PEAK = 0.65
+MOVIE_PEAK_SECONDS = 12
 SYSTEM_TIMELINE_DRIFT_MS = 150
 GLANCE_MIN_SECONDS = 180
 GLANCE_AVERAGE_SECONDS = 600
@@ -61,9 +64,10 @@ class SharedMedia(QObject):
         self._item_at = self._changed_at = self._sync_at = 0
         self._timeline = self._timeline_item = None
         self._pending = self._speech = None
-        self._last_comment = self._last_movie_l1 = float("-inf")
+        self._last_comment = float("-inf")
         self._seen_reaction = None
         self._hot_at = float("-inf")
+        self._movie_peak = None
         self._pose = ("neutral", 0)
         self._credits = self._owner_speaking = False
         self._frame_glance = False
@@ -220,6 +224,7 @@ class SharedMedia(QObject):
     def interrupt_reaction(self):
         self._epoch += 1
         self._pending = None
+        self._movie_peak = None
         self._cancel_glance()
         if self._comment_task is not None:
             self._comment_task.cancel()
@@ -432,7 +437,7 @@ class SharedMedia(QObject):
                 if (item and self._kind == "music"
                         and (previous or (item.position_ms is not None and item.position_ms < 4000))):
                     self._offer("L1", "track_change")
-            elif paused and item.status == "paused":
+            elif paused and item.status == "paused" and (self._kind == "music" or not item.ended):
                 self._offer("L2" if self._kind == "movie" else "L1", "pause")
                 self._offer_glance("pause")
             elif paused and self._kind == "music" and item.position_ms is not None and item.position_ms < 1000:
@@ -440,13 +445,17 @@ class SharedMedia(QObject):
         self._changed_at = now
         if item is not None:
             cue, gap, credits = self._context()
-            if credits or (self._kind == "movie" and item.ended):
+            if credits:
                 self.mark_credits()
-            if self._kind == "movie" and not self._credits and item.status == "playing":
+            if self._kind == "movie" and not self._credits and not item.ended and item.status == "playing":
                 if ((item.loudness is not None and item.loudness >= 0.25)
                         or (cue and any(marker in cue.lower() for marker in ("[screams", "[gasps", "尖叫", "惊呼")))):
                     self._hot_at = now
-                if (gap >= MIN_GAP_MS and now - self._hot_at < 6 and now - self._last_movie_l1 >= 300
+                if self._movie_peak is not None and now - self._movie_peak[0] >= MOVIE_PEAK_SECONDS:
+                    self._movie_peak = None
+                if not seeked and item.loudness is not None and item.loudness >= MOVIE_MIN_PEAK:
+                    self._movie_peak = now, item.loudness
+                if (gap >= MOVIE_SUBTITLE_GAP_MS and self._movie_peak is not None
                         and self._pending is None and self._comment_task is None):
                     self._offer("L1", "subtitle_gap")
         self._animate()
@@ -472,9 +481,14 @@ class SharedMedia(QObject):
                 or (anchor_changed and drift < -SYSTEM_TIMELINE_DRIFT_MS))
 
     def _context(self):
-        if self._item and self._timeline and self._timeline_item == self._item.key:
-            return self._timeline.context(self._item.position_ms)
-        return None, 0, False
+        item = self._item
+        if item is None or self._timeline is None or self._timeline_item != item.key:
+            return None, 0, False
+        movie = self._kind == "movie"
+        cue, gap, credits = self._timeline.context(item.position_ms, require_next=movie)
+        if movie and item.position_ms is not None and item.duration_ms is not None:
+            gap = max(0, min(gap, item.duration_ms - item.position_ms))
+        return cue, gap, credits
 
     def _snapshot(self):
         item = self._item
@@ -505,6 +519,9 @@ class SharedMedia(QObject):
                     media["loudness"] = level
             wire["media"] = media
         elif operation == "comment":
+            for key in ("trigger", "subtitle_gap_ms"):
+                if key in payload:
+                    wire[key] = payload[key]
             cue = wire_text(payload.get("cue"), 300)
             if cue:
                 wire["cue"] = cue
@@ -558,7 +575,12 @@ class SharedMedia(QObject):
                 return item.position_ms < 4000 and gap >= needed_gap
             return (item.position_ms is None or item.position_ms < 4000) and self.clock() - self._item_at < 4
         if tier == "L1":
-            return item.status == "playing" and gap >= needed_gap and (presenting or age < 6)
+            if item.status != "playing":
+                return False
+            if presenting:
+                return gap >= needed_gap
+            return (gap >= MOVIE_SUBTITLE_GAP_MS and self._movie_peak is not None
+                    and self.clock() - self._movie_peak[0] < MOVIE_PEAK_SECONDS)
         if reason == "pause":
             return item.status == "paused"
         return presenting or age < 12
@@ -614,6 +636,7 @@ class SharedMedia(QObject):
             if glance is not None and self.clock() - glance[2] >= GLANCE_MAX_AGE:
                 glance = self._glance_pending = None
             operation, payload = None, {}
+            peak_at = None
             desired, epoch = self._desired_id, self._epoch
             if self._uncertain:
                 operation = "status"
@@ -628,6 +651,8 @@ class SharedMedia(QObject):
                     self._comment_task is None and self._speech is None and self.clock() >= self._sync_at)):
                 operation = "update"
                 payload = {"media_id": desired, "media": self._snapshot()}
+                if comment and pending[2] == "subtitle_gap":
+                    peak_at, payload["media"]["loudness"] = self._movie_peak
             if operation is None:
                 return
             if operation != "status":
@@ -663,11 +688,8 @@ class SharedMedia(QObject):
             if (operation == "update" and comment and self._pending is pending
                     and self._eligible(*pending[1:]) and self.can_present()):
                 self._pending = None
-                if self._kind == "movie" or self._item.status == "playing":
-                    self._last_comment = self.clock()
-                if self._kind == "movie" and pending[1] == "L1":
-                    self._last_movie_l1 = self._last_comment
-                self._comment_task = self.loop.create_task(self._comment(ref, remote, self._seq, *pending))
+                self._comment_task = self.loop.create_task(
+                    self._comment(ref, remote, self._seq, *pending, peak_at=peak_at))
 
     async def _send_glance(self, media_id, seq, epoch, reason, frame, at):
         task = asyncio.current_task()
@@ -721,7 +743,7 @@ class SharedMedia(QObject):
             raise ProtocolError("invalid_response")
         return state
 
-    async def _comment(self, ref, media_id, seq, epoch, tier, reason, at):
+    async def _comment(self, ref, media_id, seq, epoch, tier, reason, at, *, peak_at):
         task = asyncio.current_task()
         context = seq, media_id, epoch, tier, reason, at
         try:
@@ -729,10 +751,18 @@ class SharedMedia(QObject):
                 self._read_local()
             if not self._valid(*context) or not self._eligible(tier, reason, at) or not self.can_present():
                 return
-            cue, _, _ = self._context()
+            if peak_at is not None and self.clock() - peak_at >= MOVIE_PEAK_SECONDS:
+                return
+            cue, gap, _ = self._context()
             payload = {"media_id": media_id, "seq": seq}
+            if self._kind == "movie":
+                payload["trigger"] = reason
+                if reason == "subtitle_gap":
+                    payload["subtitle_gap_ms"] = gap
             if cue:
                 payload["cue"] = cue
+            if self._kind == "movie" or self._item.status == "playing":
+                self._last_comment = self.clock()
             data = await self._send("comment", ref, payload)
             state = self._response_state(data)
             if state["media_id"] != media_id or state["seq"] != seq:
