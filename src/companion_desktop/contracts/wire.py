@@ -2,6 +2,8 @@
 
 import json
 import math
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -9,6 +11,11 @@ from .types import PROTOCOL, RECEIPT_STATUSES, Message, SessionRef
 
 
 MAX_REQUEST_BYTES = 262_144
+MAX_GAME_WINDOW_MS = 60_000
+MAX_GAME_CHAT_EVENTS = 32
+MAX_GAME_CHAT_TEXT = 240
+MAX_GAME_TILES = 32
+MAX_GAME_SEQUENCE = 2**53 - 1
 
 
 class ProtocolError(ValueError):
@@ -59,6 +66,10 @@ def nullable(check):
 
 def array(check):
     return lambda value: isinstance(value, list) and all(check(item) for item in value)
+
+
+def bounded_array(limit, check):
+    return lambda value: isinstance(value, list) and len(value) <= limit and all(check(item) for item in value)
 
 
 def one_of(*options):
@@ -144,6 +155,61 @@ def utterance(body):
             and all(item["text_offset"] <= len(body["text"]) for item in body["cues"]))
 
 
+def game_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
+
+
+def farmer_id(value):
+    return (isinstance(value, str) and re.fullmatch(r"(?:0|-?[1-9][0-9]{0,19})", value) is not None
+            and -(2**63) <= int(value) < 2**64)
+
+
+def game_sequence(value):
+    return positive(value) and value <= MAX_GAME_SEQUENCE
+
+
+def tile_coordinate(value):
+    return uint(value) and value <= 1023
+
+
+def game_chat_text(value):
+    return (string(value) and len(value) <= MAX_GAME_CHAT_TEXT
+            and all(unicodedata.category(char) not in {"Cc", "Cf", "Cs", "Zl", "Zp"} for char in value))
+
+
+_BOOL = lambda value: type(value) is bool
+_TILE = {"x": tile_coordinate, "y": tile_coordinate}
+_FARMER = shape({**_TILE, "farmer_id": farmer_id, "alias": one_of("Farmer 1", "Farmer 2", "Farmer 3", "Farmer 4"),
+                 "map": game_id, "is_host": _BOOL, "is_local": _BOOL})
+_GAME_SNAPSHOT = shape({
+    "game": one_of("stardew"), "farmers": bounded_array(4, _FARMER),
+    "watering_tiles": bounded_array(MAX_GAME_TILES, shape({**_TILE, "watered": _BOOL})),
+}, {"farm_ref": game_id})
+_GAME_CHAT = shape({"seq": game_sequence, "farmer_id": farmer_id, "channel": one_of("public"), "text": game_chat_text})
+
+
+def game_state(body):
+    if not fields(body, {
+        "game_session_id": game_id, "window_id": game_id, "window_revision": game_sequence,
+        "window_ttl_ms": lambda value: uint(value) and value <= MAX_GAME_WINDOW_MS,
+        "seq": game_sequence, "snapshot": nullable(_GAME_SNAPSHOT),
+        "chat_events": bounded_array(MAX_GAME_CHAT_EVENTS, _GAME_CHAT), "gap": _BOOL,
+    }):
+        return False
+    if not body["window_ttl_ms"]:
+        return body["snapshot"] is None and not body["chat_events"] and not body["gap"]
+    if body["snapshot"] is None:
+        return False
+    farmers = body["snapshot"]["farmers"]
+    ids = {item["farmer_id"] for item in farmers}
+    events = body["chat_events"]
+    return (len(ids) == len(farmers) == len({item["alias"] for item in farmers})
+            and sum(item["is_local"] for item in farmers) == 1
+            and sum(item["is_host"] for item in farmers) == 1
+            and all(item["farmer_id"] in ids for item in events)
+            and all(earlier["seq"] < later["seq"] for earlier, later in zip(events, events[1:])))
+
+
 _CHECKS = {
     "capabilities": shape({**_MODEL,
         "avatar": shape({"actions": array(shape({"name": string, "binding": string})),
@@ -172,9 +238,11 @@ _CHECKS = {
     "turn.cancel": shape({"turn_id": string}),
     "turn.cancelled": shape({"turn_id": string, "status": one_of("cancelled", "unknown"), "reason": string}),
     "turn.text": shape({"turn_id": string, "seq": positive, "text": string}),
+    "game.state": game_state,
 }
 
-CLIENT_TYPES = frozenset(("capabilities", "receipt", "observation", "wardrobe_applied", "turn.send", "turn.cancel"))
+CLIENT_TYPES = frozenset(("capabilities", "receipt", "observation", "wardrobe_applied", "turn.send", "turn.cancel",
+                          "game.state"))
 HOST_TYPES = frozenset(_CHECKS) - CLIENT_TYPES
 
 

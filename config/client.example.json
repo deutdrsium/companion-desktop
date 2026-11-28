@@ -27,6 +27,11 @@
   },
   "headset_barge_in": false,
   "shared_media_enabled": false,
+  "stardew": {
+    "enabled": false,
+    "mcp_url": "http://127.0.0.1:18081/mcp",
+    "watering_tiles": []
+  },
   "avatar": {
     "mapping": "",
     "port": 8001,

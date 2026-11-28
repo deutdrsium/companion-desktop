@@ -62,9 +62,11 @@ def unavailable(intent, capabilities, permissions, game_windows, now):
     scope = intent["scope"]
     if scope not in permissions:
         return OutputResult("rejected", "unauthorized")
-    if capabilities is None or intent["capability_revision"] != capabilities["revision"]:
+    if capabilities is None:
         return OutputResult("rejected", "stale_capabilities")
     if scope == "avatar":
+        if intent["capability_revision"] != capabilities["revision"]:
+            return OutputResult("rejected", "stale_capabilities")
         if intent["model_id"] != capabilities["model_id"]:
             return OutputResult("rejected", "stale_model")
         actions = capabilities["avatar"]["actions"]
@@ -73,6 +75,8 @@ def unavailable(intent, capabilities, permissions, game_windows, now):
         game = next((item for item in capabilities["games"] if item["game_session_id"] == game_id), None)
         if game is None:
             return OutputResult("unsupported", "missing_dependency")
+        if intent["capability_revision"] != game["capability_revision"]:
+            return OutputResult("rejected", "stale_capabilities")
         window = game_windows.get(game_id)
         if (window is None or window[:2] != (intent["window_id"], intent["window_revision"])
                 or now >= window[2]):
@@ -107,10 +111,14 @@ class Dispatcher:
         revision_changed = old is not None and old["revision"] != capabilities["revision"]
         changed = set(self.permissions - permissions)
         if revision_changed:
-            changed.update(self.outputs)
+            changed.add("avatar")
+        if old is not None and any(game not in capabilities["games"] for game in old["games"]):
+            changed.add("game")
+        if "game" in changed:
             self.game_windows.clear()
         for scope in changed & self.outputs.keys():
-            self._release(scope, "capabilities_changed" if revision_changed else "unauthorized")
+            reason = "capabilities_changed" if revision_changed or scope in permissions else "unauthorized"
+            self._release(scope, reason)
         self.capabilities = deepcopy(capabilities)
         role = self._role_snapshot
         if "avatar" in permissions and ("avatar" not in self.permissions or revision_changed):
@@ -207,6 +215,9 @@ class Dispatcher:
             output.release(reason)
 
     def expire(self):
+        for game_id, (_, revision, deadline) in tuple(self.game_windows.items()):
+            if self.clock() >= deadline:
+                self.set_game_window(game_id, None, revision, deadline=0)
         for task in tuple(self._tasks.values()):
             if task.active and self.clock() >= task.deadline:
                 self._cancel_task(task, "no_time_window")

@@ -171,6 +171,23 @@ class Controller(QObject):
             t.open_settings.connect(lambda: self.open_settings(0))
             t.quit.connect(self.quit)
             t.set_checks(False, False, self.prefs.get("pinned"))
+            if self.device and getattr(self.backend, "stardew", None) is not None:
+                action = t.menu.addAction("开启星露谷联机桥接（60 秒）")
+
+                def update_stardew():
+                    status = self.backend.stardew_status()
+                    active = status["state"] in {"connecting", "active"}
+                    action.setText("停止星露谷联机桥接" if active else "开启星露谷联机桥接（60 秒）")
+                    action.setEnabled(active or status["authorized"])
+
+                t.menu.aboutToShow.connect(update_stardew)
+                action.triggered.connect(self._toggle_stardew)
+
+    def _toggle_stardew(self):
+        if self.backend.stardew_status()["state"] in {"connecting", "active"}:
+            self.backend.stop_stardew()
+        else:
+            self.backend.start_stardew()
 
     def start(self):
         """Connected: open the screen session and load history."""
