@@ -312,6 +312,70 @@ def test_movie_short_reaction_syncs_peak_and_reads_subtitle_gap_at_request(
     asyncio.run(run())
 
 
+def test_movie_short_reaction_keeps_newest_qualifying_peak(qapp, monkeypatch, tmp_path):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    captions = tmp_path / "peaks.srt"
+    captions.write_text("1\n00:13:19,000 --> 00:13:33,000\nFirst line\n\n"
+                        "2\n00:13:39,950 --> 00:13:41,000\nNext line\n", encoding="utf-8")
+
+    async def run():
+        clock = [800]
+        host = MediaHost()
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: REF, clock=lambda: clock[0])
+        media.can_present = lambda: True
+        media.local_player.set_item(position_ms=800_000, duration_ms=900_000, loudness=0.91)
+        media.set_timed_text(captions)
+        try:
+            assert media.start("local_player", "movie")
+            await settle()
+            clock[0] = 811
+            media.local_player.set_item(position_ms=811_000, loudness=0.72)
+            await settle()
+            assert all(operation != "comment" for operation, _ in host.calls)
+            clock[0] = 813
+            media.local_player.set_item(position_ms=813_000, loudness=None)
+            await settle()
+            (update_op, update), (comment_op, comment) = host.calls[-2:]
+            assert (update_op, comment_op) == ("update", "comment")
+            assert update["media"]["loudness"] == 0.72
+            assert comment == {"media_id": update["media_id"], "seq": update["seq"], "trigger": "subtitle_gap",
+                               "subtitle_gap_ms": 6950}
+        finally:
+            await media.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("duration_ms", "expected_gap"), [
+    (614_000, None), (617_000, 3950), (625_000, 6950), (None, 6950),
+])
+def test_movie_short_reaction_bounds_subtitle_gap_by_duration(qapp, monkeypatch, tmp_path, duration_ms, expected_gap):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    captions = tmp_path / "past-end.srt"
+    captions.write_text("1\n00:10:12,000 --> 00:10:13,000\nFirst line\n\n"
+                        "2\n00:10:20,000 --> 00:10:21,000\nNext line\n", encoding="utf-8")
+
+    async def run():
+        clock = [612]
+        host = MediaHost()
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: REF, clock=lambda: clock[0])
+        media.can_present = lambda: True
+        media.local_player.set_item(position_ms=612_000, duration_ms=duration_ms, loudness=0.8)
+        media.set_timed_text(captions)
+        try:
+            assert media.start("local_player", "movie")
+            await settle()
+            clock[0] = 613.05
+            media.local_player.set_item(position_ms=613_050, loudness=None)
+            await settle()
+            comments = [payload["subtitle_gap_ms"] for operation, payload in host.calls if operation == "comment"]
+            assert comments == ([] if expected_gap is None else [expected_gap])
+        finally:
+            await media.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(("level", "elapsed", "position", "timed_text"), [
     (0.64, 1, 1000, True),
     (0.8, 12, 1000, True),

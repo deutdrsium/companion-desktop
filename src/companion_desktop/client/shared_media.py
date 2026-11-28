@@ -453,8 +453,7 @@ class SharedMedia(QObject):
                     self._hot_at = now
                 if self._movie_peak is not None and now - self._movie_peak[0] >= MOVIE_PEAK_SECONDS:
                     self._movie_peak = None
-                if (not seeked and item.loudness is not None and item.loudness >= MOVIE_MIN_PEAK
-                        and (self._movie_peak is None or item.loudness >= self._movie_peak[1])):
+                if not seeked and item.loudness is not None and item.loudness >= MOVIE_MIN_PEAK:
                     self._movie_peak = now, item.loudness
                 if (gap >= MOVIE_SUBTITLE_GAP_MS and self._movie_peak is not None
                         and self._pending is None and self._comment_task is None):
@@ -482,9 +481,14 @@ class SharedMedia(QObject):
                 or (anchor_changed and drift < -SYSTEM_TIMELINE_DRIFT_MS))
 
     def _context(self):
-        if self._item and self._timeline and self._timeline_item == self._item.key:
-            return self._timeline.context(self._item.position_ms, require_next=self._kind == "movie")
-        return None, 0, False
+        item = self._item
+        if item is None or self._timeline is None or self._timeline_item != item.key:
+            return None, 0, False
+        movie = self._kind == "movie"
+        cue, gap, credits = self._timeline.context(item.position_ms, require_next=movie)
+        if movie and item.position_ms is not None and item.duration_ms is not None:
+            gap = max(0, min(gap, item.duration_ms - item.position_ms))
+        return cue, gap, credits
 
     def _snapshot(self):
         item = self._item
