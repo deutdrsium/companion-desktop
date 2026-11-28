@@ -99,7 +99,7 @@ class TimedText:
             raise ValueError("invalid_timed_text")
         return cls(cues)
 
-    def context(self, position):
+    def context(self, position, *, require_next=False):
         """Return the current cue, usable gap in ms and whether credits are marked."""
         if position is None:
             return None, 0, False
@@ -111,7 +111,7 @@ class TimedText:
             while position >= self.cues[cue_index][1]:
                 cue_index -= 1
             cue = self.cues[cue_index][2]
-        gap_end = self.starts[index] if index < len(self.cues) else 2**53 - 1
+        gap_end = self.starts[index] if index < len(self.cues) else (position if require_next else 2**53 - 1)
         return cue, 0 if active else gap_end - position, bool(
             active and cue and _CREDITS.fullmatch(cue))
 

@@ -166,6 +166,7 @@ def test_seek_rejects_late_comment_without_waiting_for_host(qapp, monkeypatch):
         assert media.start("local_player", "music")
         await settle()
         assert [operation for operation, _ in host.calls] == ["start", "update", "comment"]
+        assert set(host.calls[-1][1]) == {"media_id", "seq"}
         media.seek_local(100)
         await settle()
         assert host.calls[-1][0] == "update"
@@ -211,8 +212,10 @@ def test_delivered_reaction_matches_session_item_revision_and_gap(qapp, monkeypa
     asyncio.run(run())
 
 
-def test_movie_pause_owner_and_credits_send_comments_without_new_fields(qapp, monkeypatch):
+def test_movie_pause_owner_and_credits_send_playback_triggers(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    captions = tmp_path / "credits.srt"
+    captions.write_text("1\n00:01:02,000 --> 00:01:04,000\n[End credits]\n", encoding="utf-8")
 
     async def run():
         clock = [0]
@@ -227,6 +230,7 @@ def test_movie_pause_owner_and_credits_send_comments_without_new_fields(qapp, mo
         events, tiers = [], []
         media.reaction.connect(events.append)
         media.tier.connect(tiers.append)
+        media.set_timed_text(captions)
         assert media.start("local_player", "movie")
         await settle()
         media.local_player.set_item(status="paused")
@@ -237,14 +241,110 @@ def test_movie_pause_owner_and_credits_send_comments_without_new_fields(qapp, mo
         media.set_owner_speaking(False)
         await settle()
         clock[0] = 62
-        media.mark_credits()
+        media.local_player.set_item(position_ms=62_000)
         await settle()
         comments = [payload for operation, payload in host.calls if operation == "comment"]
-        assert len(comments) == 3
-        assert all(set(payload) == {"media_id", "seq"} for payload in comments)
-        assert [event["cue"] for event in tiers if event["tier"] == "L2"] == ["pause", "owner_speech", "credits"]
+        triggers = ["pause", "owner_speech", "credits"]
+        assert [payload["trigger"] for payload in comments] == triggers
+        assert all("subtitle_gap_ms" not in payload for payload in comments)
+        assert comments[-1]["cue"] == "[End credits]"
+        assert [event["cue"] for event in tiers if event["tier"] == "L2"] == triggers
         assert events == []
         await media.close()
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def movie_captions(tmp_path):
+    captions = tmp_path / "movie.srt"
+    captions.write_text("1\n00:00:00,000 --> 00:00:01,000\n[Screams]\n\n"
+                        "2\n00:00:05,000 --> 00:00:06,000\nWhat's that?\n", encoding="utf-8")
+    return captions
+
+
+@pytest.mark.parametrize(("request_position", "update_delay", "expected_gap"), [
+    (1400, 1, 3600), (2000, 1, 3000), (2001, 1, None), (1400, 11, None),
+])
+def test_movie_short_reaction_syncs_peak_and_reads_subtitle_gap_at_request(
+        qapp, monkeypatch, movie_captions, request_position, update_delay, expected_gap):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+
+    async def run():
+        clock = [0]
+        host = MediaHost()
+
+        async def advance_during_update(operation, ref, payload):
+            result = await host(operation, ref, payload)
+            if operation == "update" and payload["media"]["position_ms"] == 1000:
+                clock[0] += update_delay
+                if update_delay > 1:
+                    media.local_player.set_item(position_ms=request_position, loudness=0.7)
+                else:
+                    media.local_player.item = replace(media.local_player.item, position_ms=request_position)
+            return result
+
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), advance_during_update, lambda: REF,
+                                         clock=lambda: clock[0])
+        media.can_present = lambda: True
+        media.set_timed_text(movie_captions)
+        try:
+            assert media.start("local_player", "movie")
+            await settle()
+            clock[0] = 600
+            media.local_player.set_item(loudness=0.8)
+            await settle()
+            assert all(operation != "comment" for operation, _ in host.calls)
+            clock[0] += 1
+            media.local_player.set_item(position_ms=1000, loudness=None)
+            await settle()
+            _, update = next(call for call in reversed(host.calls) if call[0] == "update")
+            assert update["media"]["status"] == "playing"
+            assert update["media"]["loudness"] == 0.8
+            assert update["media"]["position_ms"] == 1000
+            comments = [payload for operation, payload in host.calls if operation == "comment"]
+            expected = {"media_id": update["media_id"], "seq": update["seq"], "trigger": "subtitle_gap",
+                        "subtitle_gap_ms": expected_gap}
+            assert comments == ([expected] if expected_gap is not None else [])
+        finally:
+            await media.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("level", "elapsed", "position", "timed_text"), [
+    (0.64, 1, 1000, True),
+    (0.8, 12, 1000, True),
+    (0.8, 1, 2001, True),
+    (0.8, 7, 7000, True),
+    (0.8, 1, 1000, False),
+])
+def test_movie_short_reaction_requires_fresh_peak_and_known_gap(
+        qapp, monkeypatch, movie_captions, level, elapsed, position, timed_text):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+
+    async def run():
+        clock = [0]
+        host = MediaHost()
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), host, lambda: REF, clock=lambda: clock[0])
+        media.can_present = lambda: True
+        if timed_text:
+            media.set_timed_text(movie_captions)
+        try:
+            assert media.start("local_player", "movie")
+            await settle()
+            clock[0] = 600
+            media.local_player.set_item(loudness=level)
+            await settle()
+            clock[0] += elapsed
+            media.local_player.set_item(position_ms=position, loudness=None)
+            await settle()
+            assert all(operation != "comment" for operation, _ in host.calls)
+            media.local_player.set_item(status="paused", ended=True)
+            await settle()
+            assert all(operation != "comment" for operation, _ in host.calls)
+        finally:
+            await media.close()
 
     asyncio.run(run())
 
