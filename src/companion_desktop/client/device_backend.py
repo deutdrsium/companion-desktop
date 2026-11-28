@@ -103,11 +103,15 @@ class DeviceBackend(LegacyBackend):
 
     async def _shared_media_request(self, operation, ref, payload):
         endpoint = self.base + self.api + "/shared-media"
+        limit = 8192
+        if operation == "glance":
+            endpoint += "/glance"
+            limit = 128 * 1024
         if self.media_transport is None or self.media_transport.endpoint != endpoint:
             self.media_transport = HttpTransport(endpoint, self.key, timeout=12)
         data = json.dumps({"operation": operation, "session": ref, "payload": payload},
                           ensure_ascii=False, allow_nan=False).encode("utf-8")
-        if len(data) > 8192:
+        if len(data) > limit:
             raise ProtocolError("invalid_request")
         return await self.media_transport.request(data)
 

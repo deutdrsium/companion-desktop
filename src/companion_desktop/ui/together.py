@@ -15,8 +15,7 @@ from PyQt5.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidg
 from . import theme
 from .observe import Layer
 from .paint import IconButton
-from .settings import TOGETHER_PRIVACY as PRIVACY
-from .settings import Segmented
+from .settings import Segmented, together_privacy
 from .theme import C, RADIUS, STATE
 from .widgets import Card, button, label, set_label_color, shadow
 
@@ -330,7 +329,8 @@ class TogetherPicker(Layer):
         self.error = label("", "caption", theme.ERROR_FG, wrap=True)
         self.error.hide()
         v.addWidget(self.error)
-        v.addWidget(label(PRIVACY, "caption", "ink3", wrap=True))
+        self.privacy = label(together_privacy(False), "caption", "ink3", wrap=True)
+        v.addWidget(self.privacy)
         btns = QHBoxLayout()
         btns.addStretch(1)
         self.cancel = button("取消", "secondary")
@@ -513,6 +513,7 @@ class Together(QObject):
         self.active = False
         self.button = panel.header.together
         self.picker = TogetherPicker(panel, name, anchor=self.button, pick=pick)
+        self.picker.privacy.setText(together_privacy(prefs.get("together_frame_glance")))
         panel.layers.append(self.picker)
         self.card = NowPlayingCard(name)
         panel.media_slot.addWidget(self.card)
@@ -609,7 +610,7 @@ class Together(QObject):
         except ImportError:
             self.video = None
             return
-        self.media.local_player.player.setVideoOutput(self.video.video)
+        self.media.local_player.set_video_output(self.video.video)
         self.video.on_close = lambda: self.end(from_video=True)
         self.video.show()
 
@@ -625,6 +626,8 @@ class Together(QObject):
 
     def _close_video(self, from_video=False):
         video, self.video = self.video, None
+        if video is not None and self.media is not None and not sip.isdeleted(self.media):
+            self.media.local_player.set_video_output(None)
         if video is not None and not sip.isdeleted(video):
             video.on_close = None
             if not from_video:
@@ -648,8 +651,6 @@ class Together(QObject):
             m.stop()
             if self.source == "local_player":
                 m.local_player.player.stop()
-        if m is not None and self.video is not None:
-            m.local_player.player.setVideoOutput(None)
         self._close_video()
         self.active = False
 
@@ -732,3 +733,5 @@ class Together(QObject):
             self._reason()
         elif key == "together_source" and not self.picker.isVisible():
             self.picker.set_source(value)
+        elif key == "together_frame_glance":
+            self.picker.privacy.setText(together_privacy(value))

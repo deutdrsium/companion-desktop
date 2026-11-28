@@ -17,6 +17,8 @@ from uuid import uuid4
 
 from PyQt5.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
 
+from .frame_glance import FrameTap
+
 
 _LOCATION = re.compile(
     r"(?:^|[\s(])(?:/|~[/\\]|\.{1,2}[/\\])|file:|\b[a-z]:[/\\]|\\\\|[\w.-]+[/\\]", re.I)
@@ -131,6 +133,7 @@ class MediaItem:
 
 class LocalPlayer(QObject):
     changed = pyqtSignal()
+    frame_sampled = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -141,10 +144,14 @@ class LocalPlayer(QObject):
         self._probe = QAudioProbe(self)
         self._key = self._title = self._level = None
         self._level_at = 0.0
+        self._frame_tap = None
+        self._sample_enabled = False
+        self._sample_at = float("-inf")
         self._probe.setSource(self.player)
         self._probe.audioBufferProbed.connect(self._audio)
         self._probe.flush.connect(self.reset_level)
         self.player.setNotifyInterval(100)
+        self.player.stateChanged.connect(self._video_state)
         for signal in (self.player.positionChanged, self.player.durationChanged, self.player.stateChanged,
                        self.player.mediaStatusChanged, self.player.metaDataChanged):
             signal.connect(self.changed)
@@ -177,6 +184,41 @@ class LocalPlayer(QObject):
 
     def reset_level(self):
         self._level = None
+
+    def set_video_output(self, widget):
+        previous, self._frame_tap = self._frame_tap, None
+        self._sample_at = float("-inf")
+        if widget is not None:
+            output = widget.videoSurface()
+            self._frame_tap = FrameTap(output, self._sample_frame, self)
+            self.player.setVideoOutput([output, self._frame_tap])
+        else:
+            self.player.setVideoOutput(None)
+        if previous is not None:
+            previous.deleteLater()
+
+    def set_frame_sampling(self, enabled):
+        self._sample_enabled = enabled
+        if not enabled:
+            self._sample_at = float("-inf")
+
+    def _video_state(self, state):
+        if self._sample_enabled and state == self.player.StoppedState:
+            self._sample_at = float("-inf")
+            self.frame_sampled.emit(None)
+
+    def _sample_frame(self, tap, frame):
+        now = monotonic()
+        if (not self._sample_enabled or tap is not self._frame_tap
+                or self.player.state() == self.player.StoppedState or now - self._sample_at < 1 / 3):
+            return
+        self._sample_at = now
+        image = frame.image()
+        if not image.isNull():
+            surface_format = tap.surfaceFormat()
+            if surface_format.scanLineDirection() == surface_format.BottomToTop:
+                image = image.mirrored(False, True)
+            self.frame_sampled.emit(image)
 
     def _audio(self, buffer):
         if self.player.state() != self.player.PlayingState or not buffer.isValid():

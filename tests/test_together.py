@@ -4,11 +4,11 @@ from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QWidget
 
 from companion_desktop.ui.chat_view import ReactionBubble
-from companion_desktop.ui.paint import Character
+from companion_desktop.ui.paint import Character, Toggle
 from companion_desktop.ui.panel import Panel
 from companion_desktop.ui.session_state import SessionState
-from companion_desktop.ui.settings import PAGES, SettingsWindow
-from companion_desktop.ui.together import PRIVACY, Together, app_name, progress_text
+from companion_desktop.ui.settings import GLANCE_LABEL, GLANCE_PRIVACY, PAGES, SettingsWindow, together_privacy
+from companion_desktop.ui.together import Together, app_name, progress_text
 from companion_desktop.ui.tray import Tray
 from fakes import FakeMedia
 
@@ -251,7 +251,7 @@ def test_tray_and_settings_entries(ctl):
     w = SettingsWindow(ctl.character, ctl.prefs, ctl.state)
     w.show_page(PAGES.index("一起听看"))
     texts = [lab.text() for lab in w.stack.currentWidget().findChildren(type(w.version))]
-    assert PRIVACY in texts and "一起听看" in texts
+    assert together_privacy(False) in texts and "一起听看" in texts
     w.together_source.buttons[1].click()
     assert ctl.prefs.get("together_source") == "system_media"
     assert PAGES[-1] == "连接"
@@ -420,4 +420,19 @@ def test_file_dialog_does_not_block_timers(qapp, prefs):
 
 def test_privacy_line_lists_what_is_sent():
     for word in ("标题", "音乐还是电影", "播放来源", "播放或暂停", "进度", "已去掉网址", "声音大小的数值", "歌手名"):
-        assert word in PRIVACY
+        assert word in together_privacy(False)
+
+
+def test_frame_glance_setting_updates_privacy(ctl):
+    window = SettingsWindow(ctl.character, ctl.prefs, ctl.state)
+    window.show_page(PAGES.index("一起听看"))
+    page = window.stack.currentWidget()
+    labels = page.findChildren(type(window.version))
+    toggle = next(child for child in page.findChildren(Toggle) if child.accessibleName() == GLANCE_LABEL)
+    assert not toggle.isChecked()
+    assert GLANCE_PRIVACY in [label.text() for label in labels]
+    for enabled in (True, False):
+        toggle.click()
+        assert ctl.prefs.get("together_frame_glance") is enabled
+        assert together_privacy(enabled) in [label.text() for label in labels]
+        assert ctl.together.picker.privacy.text() == together_privacy(enabled)

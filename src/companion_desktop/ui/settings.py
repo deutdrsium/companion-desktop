@@ -14,8 +14,16 @@ from .theme import C, STATE
 from .widgets import button, hline, label, set_label_color
 
 PAGES = ("外观", "声音", "字幕", "回复节奏", "观察", "一起听看", "连接")
-TOGETHER_PRIVACY = ("离开这台电脑的只有：标题、音乐还是电影、播放来源、播放或暂停、进度、当前这一句字幕或歌词（已去掉网址）、"
-                    "声音大小的数值；系统里正在放的音乐还会带上歌手名。画面、声音和文件本身都不会。")
+TOGETHER_PRIVACY = ("会发送标题、音乐还是电影、播放来源、播放或暂停、进度、当前一句字幕或歌词（已去掉网址）和声音大小的数值。"
+                    "系统里正在放的音乐还会带上歌手名。声音和文件本身留在这台电脑。")
+GLANCE_LABEL = "偶尔看一眼画面"
+GLANCE_PRIVACY = "开启后，镜头大切换时会把一张缩小的画面发给模型看一眼，大约十分钟一次，不保存"
+
+
+def together_privacy(glance_enabled):
+    if glance_enabled:
+        return TOGETHER_PRIVACY + "用桌面播放器看电影时，镜头大切换、暂停或你说话后，还可能发送一张缩小的电影画面。"
+    return TOGETHER_PRIVACY + "画面也留在这台电脑。"
 
 # Reply-rhythm presets: (min wait, max wait, total cap) in ms.
 RHYTHM_PRESETS = [("快", 300, 1000, 3000), ("适中", 600, 1500, 4000), ("从容", 1500, 3000, 8000)]
@@ -30,7 +38,8 @@ class Prefs(QObject):
     DEFAULTS = {"pinned": True, "close_to_tray": True, "voice_enabled": True, "volume": 100,
                 "subtitle_style": "plate", "subtitle_size": 100, "subtitle_hold_ms": 1800,
                 "subtitle_nameplate": True, "consent_periodic": False, "consent_autonomous": False,
-                "tray_hint_shown": False, "together_enabled": True, "together_source": "local_player"}
+                "tray_hint_shown": False, "together_enabled": True, "together_source": "local_player",
+                "together_frame_glance": False}
 
     def __init__(self, org="CompanionDesktop", app="Panel"):
         super().__init__()
@@ -568,6 +577,9 @@ class SettingsWindow(QWidget):
         self.together_source = source
         self.together_note = label("", "caption", theme.ERROR_FG, wrap=True)
         self.together_note.hide()
+        glance = self._toggle("together_frame_glance", GLANCE_LABEL)
+        privacy = label(together_privacy(glance.isChecked()), "body", "ink2", wrap=True)
+        glance.toggled.connect(lambda enabled: privacy.setText(together_privacy(enabled)))
         return [label("一起听看", "title"),
                 label(f"听歌或看电影时，{name}可以陪着你，偶尔轻声说一两句。每次都要你自己点开始。",
                       "body", "ink2", wrap=True),
@@ -575,9 +587,9 @@ class SettingsWindow(QWidget):
                      "关掉后面板和托盘里的入口只会说明为什么不能用；正在进行的会立即结束。"),
                 _row("默认来源", source, "桌面播放器：在面板里选一个本地文件，可加 SRT 字幕或 LRC 歌词。"
                      "正在播放的软件：跟着 Windows 报告的播放器，只读状态，不替它控制播放。"),
+                _row(GLANCE_LABEL, glance, GLANCE_PRIVACY),
                 self.together_note, hline(),
-                label("会发送什么", "body", bold=True),
-                label(TOGETHER_PRIVACY, "body", "ink2", wrap=True)]
+                label("会发送什么", "body", bold=True), privacy]
 
     def set_together_note(self, text):
         self.together_note.setText(text or "")

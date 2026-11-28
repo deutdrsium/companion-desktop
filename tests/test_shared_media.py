@@ -6,10 +6,12 @@ from threading import Event, get_ident
 from time import sleep
 from types import SimpleNamespace
 
+import pytest
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 from companion_desktop.client import shared_media
 from companion_desktop.client.media_sources import LocalPlayer, MediaItem, SystemMedia, TimedText
+from companion_desktop.contracts.wire import ProtocolError
 
 
 REF = {"device_id": "device", "desktop_session_id": "session", "generation": 1}
@@ -17,10 +19,12 @@ REF = {"device_id": "device", "desktop_session_id": "session", "generation": 1}
 
 class LocalSource(QObject):
     changed = pyqtSignal()
+    frame_sampled = pyqtSignal(object)
 
     def __init__(self, parent):
         super().__init__(parent)
         self.player = self
+        self.frame_sampling = False
         self.item = MediaItem("first", "First", "playing", 0, 90_000, loudness=0.4)
 
     def snapshot(self):
@@ -39,6 +43,9 @@ class LocalSource(QObject):
     def reset_level(self):
         pass
 
+    def set_frame_sampling(self, enabled):
+        self.frame_sampling = enabled
+
 
 class MediaHost:
     def __init__(self):
@@ -53,6 +60,9 @@ class MediaHost:
         self.calls.append((operation, payload))
         if operation == "status":
             assert payload == {}
+        elif operation == "glance":
+            assert payload["seq"] == self.state["seq"]
+            assert payload["media_id"] == self.state["media_id"]
         elif operation == "comment":
             assert payload["seq"] == self.state["seq"]
             result = self.state.copy()
@@ -451,9 +461,22 @@ def test_shared_media_http_uses_existing_authenticated_transport(monkeypatch):
 
     monkeypatch.setattr(device_backend, "HttpTransport", CaptureTransport)
     backend = SimpleNamespace(base="http://127.0.0.1", api="/desktop", key="synthetic", media_transport=None)
-    asyncio.run(device_backend.DeviceBackend._shared_media_request(backend, "status", REF, {}))
+    async def run():
+        request = device_backend.DeviceBackend._shared_media_request
+        await request(backend, "status", REF, {})
+        payload = {"media_id": "0" * 32, "seq": 7, "reason": "pause", "image": "A" * 106_668}
+        await request(backend, "glance", REF, payload)
+        with pytest.raises(ProtocolError, match="invalid_request"):
+            await request(backend, "comment", REF, {"cue": "A" * 8192})
+        with pytest.raises(ProtocolError, match="invalid_request"):
+            await request(backend, "glance", REF, {**payload, "image": "A" * (128 * 1024)})
+        return payload
+
+    payload = asyncio.run(run())
     assert sent == [("http://127.0.0.1/desktop/shared-media",
-                     {"operation": "status", "session": REF, "payload": {}})]
+                     {"operation": "status", "session": REF, "payload": {}}),
+                    ("http://127.0.0.1/desktop/shared-media/glance",
+                     {"operation": "glance", "session": REF, "payload": payload})]
 
 
 def test_controller_presents_without_chat_and_drops_late_synthesis(qapp, prefs, monkeypatch):
@@ -482,7 +505,11 @@ def test_controller_presents_without_chat_and_drops_late_synthesis(qapp, prefs, 
                                 subtitles=subtitles, device=True)
         media = controller.shared_media
         try:
+            assert not media._frame_glance
+            prefs.set("together_frame_glance", True)
+            assert media._frame_glance
             assert media.start("local_player", "music")
+            assert not media.local_player.frame_sampling
             await settle()
             assert backend.speech == [(["Listen!"], 0, 0)]
             assert backend.chats == [] and controller.active_turn is None

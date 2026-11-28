@@ -65,6 +65,11 @@ In the panel, the ♪ header button, the "更多" menu and the tray menu open �
 `speak` grant is missing. A now-playing card sits above the conversation, and it folds to one
 row for films. A local film plays in its own window. Reactions appear as small bubbles, and
 cancelled ones are removed. Settings → 一起听看 turns the entry off and sets the default source.
+Its 偶尔看一眼画面 switch defaults off. For a local film it can send a resized JPEG
+after a major cut with a subtitle change or loudness peak, on pause, or after
+the owner's speech. Frames stay in memory on the desktop and are sampled only
+while enabled. Uploads average at most one per ten minutes, at least three
+minutes apart, and use the authenticated `/desktop/shared-media/glance` route.
 
 Shared snapshots contain a sanitized title, media kind, source, playback status and
 timing. Local audio contributes numeric RMS levels. Only Windows music sessions can

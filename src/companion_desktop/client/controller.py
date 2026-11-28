@@ -87,6 +87,7 @@ class Controller(QObject):
         self.guard.timeout.connect(self._guard)
         self._wire()
         if self.shared_media is not None:
+            self.shared_media.set_frame_glance(prefs.get("together_frame_glance"))
             self.shared_media.can_present = self._media_ready
             self.shared_media.reaction.connect(self._play_media_reaction)
             self.shared_media.reaction_cancelled.connect(self._cancel_media_reaction)
@@ -262,6 +263,8 @@ class Controller(QObject):
             self.player.set_volume(value)
         elif key.startswith("subtitle_"):
             self._subtitle_style()
+        elif key == "together_frame_glance" and self.shared_media is not None:
+            self.shared_media.set_frame_glance(value)
         elif key == "voice_enabled" and not value:
             if self.device and (self.reading is not None or self._media_reaction_id is not None):
                 self.stop()
