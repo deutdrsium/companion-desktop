@@ -7,7 +7,7 @@ import sqlite3
 from collections import OrderedDict, deque
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import Protocol
 from uuid import uuid4
@@ -20,6 +20,7 @@ from companion_desktop.contracts.wire import (
 from companion_desktop.session.dispatcher import OutputResult, result_body, task_parameters, unavailable
 
 BATCH_LIMIT = 32
+GAME_SESSION_LIMIT = 64
 PENDING_REGISTRATION_LIMIT = 8
 LEASE_SECONDS = 20
 TURN_TIMEOUT_SECONDS = 450
@@ -201,6 +202,18 @@ class SessionHost:
                 if owner == key:
                     self._stop_turn(turn)
 
+    def revoke_game(self, device_id):
+        """Remove the game grant from the device's current and reserved desktop generations."""
+        connections = list(self._pending_registrations.get(device_id, {}).values())
+        current = self._connections.get(device_id)
+        if current is not None:
+            connections.append(current)
+        for connection in connections:
+            connection.binding = replace(connection.binding, permissions=connection.binding.permissions - {"game"})
+            connection.permissions -= {"game"}
+            connection.windows.clear()
+            self._invalidate_scopes(connection, {"game"}, "unauthorized")
+
     def _register(self, binding, payload):
         if not fields(payload, {"protocols": array(string), "permissions": array(lambda item: item in PERMISSIONS)},
                       {"activate_on_exchange": lambda value: value is True}):
@@ -317,14 +330,11 @@ class SessionHost:
                     return
                 ttl = min(ttl, window[2] - now)
         else:
+            if len(connection.game_sequences) >= GAME_SESSION_LIMIT:
+                return
             chat_seq = 0
         events = [event for event in body["chat_events"] if event["seq"] > chat_seq]
         connection.game_sequences[game_id] = (revision, window_id, seq, events[-1]["seq"] if events else chat_seq)
-        if len(connection.game_sequences) > 64:
-            oldest = next((key for key in connection.game_sequences if key not in connection.windows and key != game_id),
-                          None)
-            if oldest is not None:
-                del connection.game_sequences[oldest]
         self.set_game_window(connection.ref, game_id, window_id if ttl else None, revision, deadline=now + ttl)
         if on_message is not None:
             remaining_ms = max(1, int(ttl * 1000)) if ttl else 0
