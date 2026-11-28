@@ -18,10 +18,13 @@ from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, PROTOCOL, Connection
 from companion_desktop.contracts.wire import (
-    HOST_TYPES, MAX_REQUEST_BYTES, ProtocolError, array, encode_request, fields, message, obj,
-    observation_state, parse, parse_ref,
+    GAME_STATE_FEATURE, GAME_STATE_OFFER, HOST_TYPES, MAX_GAME_CHAT_EVENTS, MAX_REQUEST_BYTES, ProtocolError,
+    array, encode_request, fields, message, obj, observation_state, parse, parse_ref, string,
 )
 from .dispatcher import Dispatcher
+
+
+_GAME_GRANT_SECONDS = 10
 
 
 class Session(Protocol):
@@ -249,7 +252,7 @@ class HttpTransport:
 class DesktopSession(_SessionEvents):
     """One event-loop-owned device session. Transport and outputs are injectable."""
 
-    def __init__(self, transport, *, permissions=(), avatar=None, game=None, poll_interval=0.25,
+    def __init__(self, transport, *, permissions=(), avatar=None, game=None, game_state=False, poll_interval=0.25,
                  clock=monotonic):
         super().__init__()
         self._transport = transport
@@ -263,6 +266,11 @@ class DesktopSession(_SessionEvents):
                             "avatar": {"actions": [], "inputs": [], "hotkeys": []},
                             "observations": [], "games": []}
         self._published_revision = 0
+        self._published_games = []
+        self._game_state = None
+        self._offer_game_state = game_state
+        self._game_state_supported = False
+        self._game_granted_at = None
         self._reports = deque()
         self._sends = {}
         self._active_turns = {}
@@ -280,11 +288,17 @@ class DesktopSession(_SessionEvents):
     def granted_session(self, permission):
         if (permission in self._grant and self._connection["state"] == "connected"
                 and not self._closing and not self._reconfigure):
+            if permission == "game" and (self._game_granted_at is None
+                                         or self._clock() - self._game_granted_at >= _GAME_GRANT_SECONDS):
+                return None
             return self.session
         return None
 
     def capabilities_published(self, revision):
         return self.session is not None and self._published_revision == revision
+
+    def game_state_session(self):
+        return self.granted_session("game") if self._game_state_supported else None
 
     def start(self):
         if self._runner is None or self._runner.done():
@@ -323,7 +337,10 @@ class DesktopSession(_SessionEvents):
             raise ProtocolError("invalid_request")
         if body == self._local_caps:
             return
-        if body["revision"] <= self._local_caps["revision"] and self._published_revision:
+        game_only = self._game_state_supported and body.keys() == self._local_caps.keys() and all(
+            value == self._local_caps[key] for key, value in body.items() if key != "games"
+        )
+        if body["revision"] <= self._local_caps["revision"] and self._published_revision and not game_only:
             raise ProtocolError("stale_capabilities")
         self._local_caps = body
         if self.session is not None:
@@ -341,6 +358,27 @@ class DesktopSession(_SessionEvents):
 
     def set_game_window(self, game_session_id, window_id, window_revision, *, deadline):
         self.dispatcher.set_game_window(game_session_id, window_id, window_revision, deadline=deadline)
+
+    def publish_games(self, games):
+        if self._game_state_supported:
+            self.publish_capabilities({**self._local_caps, "games": games})
+
+    def report_game_state(self, body, *, session):
+        if session is None or session != self.game_state_session():
+            return False
+        body = message("game.state", session, deepcopy(body))["body"]
+        pending = self._game_state
+        if (pending is not None and body["window_ttl_ms"] and pending["window_ttl_ms"]
+                and body["game_session_id"] == pending["game_session_id"]
+                and body["window_id"] == pending["window_id"] and body["window_revision"] == pending["window_revision"]):
+            roster = {farmer["farmer_id"] for farmer in body["snapshot"]["farmers"]}
+            events = {event["seq"]: event for event in pending["chat_events"] + body["chat_events"]}
+            kept = [event for _, event in sorted(events.items()) if event["farmer_id"] in roster]
+            body = {**body, "chat_events": kept[-MAX_GAME_CHAT_EVENTS:],
+                    "gap": body["gap"] or pending["gap"] or len(events) != min(len(kept), MAX_GAME_CHAT_EVENTS)}
+        self._game_state = body
+        self._wake.set()
+        return True
 
     def send_message(self, client_msg_id, text):
         previous = self._sends.get(client_msg_id) if isinstance(client_msg_id, str) else None
@@ -398,22 +436,33 @@ class DesktopSession(_SessionEvents):
 
     async def _register(self):
         requested = self._permissions
-        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested),
+        protocols = [PROTOCOL]
+        if self._offer_game_state and "game" in requested:
+            protocols.append(GAME_STATE_OFFER)
+        response = await self._transport("register", {"protocols": protocols, "permissions": sorted(requested),
                                                      "activate_on_exchange": True})
         if not fields(response, {"protocol": lambda item: item == PROTOCOL, "session": obj,
-                                 "permissions": array(lambda item: item in PERMISSIONS)}):
+                                 "permissions": array(lambda item: item in PERMISSIONS)},
+                      {"features": array(string)} if GAME_STATE_OFFER in protocols else None):
             raise ProtocolError("invalid_response")
         self.session = parse_ref(response["session"])
+        self._game_state_supported = GAME_STATE_FEATURE in response.get("features", ())
         self._reconfigure = requested != self._permissions
         self._grant = frozenset(response["permissions"]) & self._permissions
         self._published_revision = 0
+        self._published_games = []
         self.dispatcher.bind(self.session, self._grant)
         self.dispatcher.configure(self._local_caps, self._grant)
 
     def _drop(self, reason):
         self.dispatcher.disconnect(reason)
         self.session = None
+        if self._game_state_supported:
+            self._local_caps = {**self._local_caps, "games": []}
+        self._game_state_supported = False
         self._reports.clear()
+        self._game_state = None
+        self._game_granted_at = None
         self._grant = frozenset()
         self._set_capabilities()
 
@@ -443,8 +492,16 @@ class DesktopSession(_SessionEvents):
                 break
             self._reports.popleft()
         if operation == "exchange":
-            if caps["revision"] != self._published_revision:
-                append(message("capabilities", ref, caps))
+            game_state = self._game_state
+            if game_state is not None and self.game_state_session() != ref:
+                self._game_state = game_state = None
+            if game_state is not None and not game_state["window_ttl_ms"]:
+                if append(message("game.state", ref, game_state)):
+                    self._game_state = None
+                game_state = None
+            caps_pending = (caps["revision"] != self._published_revision
+                            or (self._game_state_supported and caps["games"] != self._published_games))
+            caps_ready = not caps_pending or append(message("capabilities", ref, caps)) is True
             for kind, work in (("turn.cancel", self._cancels), ("turn.send", self._sends)):
                 for key, value in tuple(work.items()):
                     body = {"turn_id": key} if kind == "turn.cancel" else {"client_msg_id": key, "text": value}
@@ -458,6 +515,14 @@ class DesktopSession(_SessionEvents):
                         else:
                             self._receive_turn("turn.cancelled", {"turn_id": key, "status": "unknown",
                                                                   "reason": "result_unknown"})
+            if game_state is not None and caps_ready:
+                window = self.dispatcher.game_windows.get(game_state["game_session_id"])
+                if window is None or window[:2] != (game_state["window_id"], game_state["window_revision"]):
+                    self._game_state = None
+                else:
+                    ttl = int((window[2] - self._clock()) * 1000)
+                    if ttl > 0 and append(message("game.state", ref, {**game_state, "window_ttl_ms": ttl})):
+                        self._game_state = None
         return payload
 
     async def _exchange(self, operation="exchange", *, attempt=0):
@@ -476,7 +541,9 @@ class DesktopSession(_SessionEvents):
             raise ProtocolError("invalid_message_direction_or_session")
         if any(frame["type"] == "capabilities" for frame in frames):
             self._published_revision = caps["revision"]
+            self._published_games = caps["games"]
         self._grant = frozenset(response["permissions"]) & self._permissions
+        self._game_granted_at = self._clock() if "game" in self._grant else None
         self.dispatcher.configure(self._local_caps, self._grant)
         self._set_capabilities(tts=caps.get("tts", False) and "speak" in self._grant,
                                mouth=caps.get("mouth", False) and "avatar" in self._grant,

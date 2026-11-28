@@ -21,6 +21,7 @@ DEFAULTS = {
     "subtitle": {"enabled": True, "port": 18676, "token_file": ""},
     "headset_barge_in": False,
     "shared_media_enabled": False,
+    "stardew": {"enabled": False, "mcp_url": "http://127.0.0.1:18081/mcp", "watering_tiles": []},
     "avatar": {"mapping": "", "port": 8001, "inputs": ["head_yaw", "head_pitch", "head_roll", "mouth_open", "mouth_form",
                                                           "eye_smile", "eye_left", "eye_right", "look_x", "look_y",
                                                           "brow_left", "brow_right"]},

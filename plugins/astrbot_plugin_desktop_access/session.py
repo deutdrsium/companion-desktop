@@ -13,7 +13,10 @@ from typing import Protocol
 from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, TERMINAL_STATUSES
-from companion_desktop.contracts.wire import CLIENT_TYPES, ProtocolError, array, fields, message, negotiate, obj, parse, parse_ref, string
+from companion_desktop.contracts.wire import (
+    CLIENT_TYPES, GAME_STATE_FEATURE, GAME_STATE_OFFER, ProtocolError, array, fields, message, negotiate,
+    obj, parse, parse_ref, string,
+)
 from companion_desktop.session.dispatcher import OutputResult, result_body, task_parameters, unavailable
 
 BATCH_LIMIT = 32
@@ -97,9 +100,11 @@ class _Connection:
     ref: dict
     permissions: frozenset[str]
     expires: float
+    game_state_supported: bool = False
     lease: asyncio.TimerHandle | None = None
     capabilities: dict | None = None
     windows: dict = field(default_factory=dict)
+    game_sequences: dict = field(default_factory=dict)
     intents: dict = field(default_factory=dict)
     observations: dict = field(default_factory=dict)
     pending: deque = field(default_factory=deque)
@@ -172,6 +177,8 @@ class SessionHost:
         removed = connection.permissions - permissions
         if removed:
             self._invalidate_scopes(connection, removed, "unauthorized")
+            if "game" in removed:
+                connection.windows.clear()
             if "observe" in removed:
                 connection.observations.clear()
             if "avatar" in removed:
@@ -199,13 +206,14 @@ class SessionHost:
                       {"activate_on_exchange": lambda value: value is True}):
             raise ProtocolError("invalid_request")
         protocol = negotiate(payload["protocols"])
+        game_state_supported = GAME_STATE_OFFER in payload["protocols"]
         granted = binding.permissions & frozenset(payload["permissions"])
         self._generation += 1
         ref = {"device_id": binding.device_id, "desktop_session_id": uuid4().hex,
                "generation": self._generation}
         now = self.clock()
         connection = _Connection(Binding(binding.device_id, binding.key, granted), ref, granted,
-                                 now + self.lease_seconds)
+                                 now + self.lease_seconds, game_state_supported=game_state_supported)
         if payload.get("activate_on_exchange"):
             pending = self._pending_registrations.setdefault(binding.device_id, {})
             for generation, candidate in tuple(pending.items()):
@@ -216,7 +224,10 @@ class SessionHost:
             pending[ref["generation"]] = connection
         else:
             self._activate(connection)
-        return {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
+        response = {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
+        if game_state_supported:
+            response["features"] = [GAME_STATE_FEATURE]
+        return response
 
     def _activate(self, connection):
         binding = connection.binding
@@ -242,16 +253,21 @@ class SessionHost:
     def _update_capabilities(self, connection, body):
         current = connection.capabilities
         if current is not None and body["revision"] <= current["revision"]:
-            if body != current:
+            if body == current:
+                return
+            if (not connection.game_state_supported or body.keys() != current.keys()
+                    or any(value != current[key] for key, value in body.items() if key != "games")):
                 raise ProtocolError("stale_capabilities")
-            return
-        self._invalidate_scopes(connection, {"avatar", "game"}, "capabilities_changed")
+        if current is not None and current["revision"] != body["revision"]:
+            self._invalidate_scopes(connection, {"avatar"}, "capabilities_changed")
+            connection.snapshots.clear()
+            connection.wardrobe_receipt = None
+        if current is not None and any(game not in body["games"] for game in current["games"]):
+            self._invalidate_scopes(connection, {"game"}, "capabilities_changed")
+            connection.windows.clear()
         connection.capabilities = deepcopy(body)
-        connection.windows.clear()
         if current is not None and body["observations"] != current["observations"]:
             connection.observations.clear()
-        connection.snapshots.clear()
-        connection.wardrobe_receipt = None
 
     def _invalidate(self, intent, reason, *, expired=False):
         if intent.result["status"] in TERMINAL_STATUSES:
@@ -280,6 +296,39 @@ class SessionHost:
                 self._invalidate(intent, "no_time_window", expired=True)
                 if intent.sent and intent.result["status"] == "unknown":
                     self.cancel_intent(ref, task_id=intent.body["task_id"], reason_code="no_time_window")
+
+    def _game_state(self, connection, frame, on_message):
+        body = frame["body"]
+        game_id = body["game_session_id"]
+        if (not connection.game_state_supported or "game" not in connection.permissions or connection.capabilities is None
+                or not any(game["game_session_id"] == game_id for game in connection.capabilities["games"])):
+            return
+        revision, window_id, seq = body["window_revision"], body["window_id"], body["seq"]
+        previous = connection.game_sequences.get(game_id)
+        now = self.clock()
+        ttl = body["window_ttl_ms"] / 1000
+        if previous is not None:
+            old_revision, old_id, old_seq, chat_seq = previous
+            if revision < old_revision or seq <= old_seq or (revision == old_revision) != (window_id == old_id):
+                return
+            if revision == old_revision:
+                window = connection.windows.get(game_id)
+                if window is None or now >= window[2]:
+                    return
+                ttl = min(ttl, window[2] - now)
+        else:
+            chat_seq = 0
+        events = [event for event in body["chat_events"] if event["seq"] > chat_seq]
+        connection.game_sequences[game_id] = (revision, window_id, seq, events[-1]["seq"] if events else chat_seq)
+        if len(connection.game_sequences) > 64:
+            oldest = next((key for key in connection.game_sequences if key not in connection.windows and key != game_id),
+                          None)
+            if oldest is not None:
+                del connection.game_sequences[oldest]
+        self.set_game_window(connection.ref, game_id, window_id if ttl else None, revision, deadline=now + ttl)
+        if on_message is not None:
+            remaining_ms = max(1, int(ttl * 1000)) if ttl else 0
+            on_message({**frame, "body": {**body, "chat_events": events, "window_ttl_ms": remaining_ms}})
 
     def current_session(self, device_id):
         connection = self._connections.get(device_id)
@@ -429,6 +478,11 @@ class SessionHost:
                 continue
             remaining = int((intent.deadline - self.clock()) * 1000)
             if remaining <= 0:
+                self._invalidate(intent, "no_time_window", expired=True)
+                continue
+            if intent.body["scope"] == "game" and unavailable(
+                intent.body, connection.capabilities, connection.permissions, connection.windows, self.clock()
+            ) is not None:
                 self._invalidate(intent, "no_time_window", expired=True)
                 continue
             intent.sent = True
@@ -600,6 +654,8 @@ class SessionHost:
                 self._receipt(connection, body)
             elif kind == "capabilities" and operation == "exchange":
                 self._update_capabilities(connection, body)
+            elif kind == "game.state" and operation == "exchange":
+                self._game_state(connection, frame, on_message)
             elif kind == "turn.send" and operation == "exchange":
                 response = self._send_turn(connection, body, turns)
                 replies.append(response)

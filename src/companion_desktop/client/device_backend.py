@@ -82,8 +82,22 @@ class DeviceBackend(LegacyBackend):
         self.history.connect(self._history_loaded)
         self.history_failed.connect(self._history_loaded)
         self.transport = None
-        self.session = DesktopSession(self._transport, permissions=("speak", "avatar") if self.avatar else ("speak",),
-                                      avatar=self.avatar)
+        self.stardew = None
+        self._stardew_disabled = "disabled"
+        permissions = ["speak", "avatar"] if self.avatar else ["speak"]
+        stardew = cfg.get("stardew")
+        if isinstance(stardew, dict) and stardew.get("enabled") is True:
+            from ..games.stardew.adapter import StardewBridge
+            from ..games.stardew.mcp_client import DEFAULT_MCP_URL
+
+            try:
+                self.stardew = StardewBridge(stardew.get("mcp_url", DEFAULT_MCP_URL), stardew.get("watering_tiles", []))
+                permissions.append("game")
+            except ValueError:
+                self._stardew_disabled = "invalid_config"
+                log.warning("Stardew bridge configuration unavailable")
+        self.session = DesktopSession(self._transport, permissions=permissions, avatar=self.avatar, game=self.stardew,
+                                      game_state=self.stardew is not None)
         self.shared_media = None
         self.media_transport = None
         if cfg.get("shared_media_enabled") is True:
@@ -134,7 +148,7 @@ class DeviceBackend(LegacyBackend):
             "revision": self.revision, "model_id": None, "asset_version": None,
             "avatar": {"actions": [], "inputs": [], "hotkeys": []}, "mouth": False,
         }
-        self.session.publish_capabilities({**avatar, "observations": [], "games": [],
+        self.session.publish_capabilities({**avatar, "observations": [], "games": self.session.device_capabilities["games"],
                                            "tts": self.tts, "subtitle": self.subtitle})
 
     def _report_wardrobe(self, body):
@@ -183,10 +197,28 @@ class DeviceBackend(LegacyBackend):
     def reconnect_session(self):
         def reconnect():
             if not self.closed:
+                if self.stardew is not None:
+                    self.stardew.stop("disconnected")
                 self.session.reconnect()
 
         if not self.closed:
             self.loop.call_soon(reconnect)
+
+    def stardew_status(self):
+        if self.stardew is None:
+            return {"state": self._stardew_disabled, "public_chat": False, "last_result": None,
+                    "authorized": False, "map": None}
+        return {**self.stardew.status, "authorized": self.session.game_state_session() is not None}
+
+    def start_stardew(self):
+        if self.closed or self.stardew is None or self.session.game_state_session() is None:
+            return False
+        self.loop.call_soon(self.stardew.open, self.session)
+        return True
+
+    def stop_stardew(self):
+        if not self.closed and self.stardew is not None:
+            self.loop.call_soon(self.stardew.stop)
 
     def _history_loaded(self, *_):
         self.history_ready = True
@@ -309,6 +341,8 @@ class DeviceBackend(LegacyBackend):
 
             async def finish():
                 try:
+                    if self.stardew is not None:
+                        await self.stardew.close()
                     if self.shared_media is not None:
                         await self.shared_media.close()
                     await self.session.close()
