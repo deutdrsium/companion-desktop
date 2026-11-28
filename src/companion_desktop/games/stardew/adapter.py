@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from ...contracts.wire import MAX_GAME_TILES, MAX_GAME_WINDOW_MS, fields, game_id, one_of, tile_coordinate
 from ...session.dispatcher import OutputResult
-from .mcp_client import McpClient, McpError, loopback_endpoint
+from .mcp_client import McpClient, McpError, McpWriteCancelled, loopback_endpoint
 from .readback import CoopState, confirmed, legacy_map, parse_state
 
 
@@ -28,6 +28,7 @@ _ENUMS = {
     "tool": ["watering_can"], "emote": list(_EMOTES), "category": list(_PUBLIC),
 }
 _UNKNOWN = OutputResult("unknown", "result_unknown")
+_ACTION_REQUEST_TIMEOUT = MAX_GAME_WINDOW_MS / 1000 + 2
 
 
 @dataclass
@@ -49,6 +50,8 @@ class _Work:
     window: _Window
     report: Callable[[OutputResult], None]
     task: asyncio.Task | None = None
+    timer: asyncio.TimerHandle | None = None
+    running_state: CoopState | None = None
     lock: LockType = field(default_factory=Lock)
     sent: bool = False
     blocked: bool = False
@@ -94,7 +97,7 @@ class StardewBridge:
                 "last_result": self._last_result, "map": state.local["map"] if state else self._legacy_map}
 
     def open(self, session, *, duration=MAX_GAME_WINDOW_MS / 1000):
-        binding = session.granted_session("game")
+        binding = session.game_state_session()
         if (binding is None or self._window is not None or self._cleanup is not None
                 or not 0 < duration <= MAX_GAME_WINDOW_MS / 1000):
             return False
@@ -108,7 +111,7 @@ class StardewBridge:
 
     def _current(self, window):
         return (self._window is window and self.clock() < window.deadline
-                and self.session.granted_session("game") == window.binding)
+                and self.session.game_state_session() == window.binding)
 
     async def _read(self, window, after_seq, *, update_aliases=False):
         result = await window.client.call("get_coop_state", {"after_seq": after_seq})
@@ -179,7 +182,7 @@ class StardewBridge:
                 if state.chat_events or state.gap or self.clock() >= next_snapshot:
                     self._publish(window, events=state.chat_events, gap=state.gap)
                     next_snapshot = self.clock() + 2
-        except (McpError, asyncio.TimeoutError):
+        except McpError:
             if self._window is window:
                 self.stop("mcp_unavailable")
         finally:
@@ -217,7 +220,19 @@ class StardewBridge:
             report(OutputResult("rejected", "busy"))
             return
         work = self._work = _Work(intent["task_id"], window, report)
-        work.task = asyncio.create_task(self._execute(window, work, intent, min(deadline, window.deadline), is_current))
+        deadline = min(deadline, window.deadline)
+        work.timer = asyncio.get_running_loop().call_later(max(0, deadline - self.clock()), self._expire_work, work)
+        work.task = asyncio.create_task(self._execute(window, work, intent, deadline, is_current))
+
+    def _expire_work(self, work):
+        if self._work is work:
+            self.stop("expired")
+
+    def _finish_work(self, work, result):
+        work.timer.cancel()
+        self._work = None
+        self._last_result = result.status
+        work.report(result)
 
     async def _report_cancel(self, cleanup, report):
         report(await asyncio.shield(cleanup))
@@ -263,27 +278,34 @@ class StardewBridge:
                 return
             arguments = self._arguments(before, action, params)
             if arguments is None:
-                self._work = None
-                work.report(OutputResult("rejected", "invalid_config"))
+                self._finish_work(work, OutputResult("rejected", "invalid_config"))
                 return
             work.report(OutputResult("running"))
-            await window.client.call(action, arguments, timeout=max(0, deadline - self.clock()),
-                                     before_write=before_write)
-            after = await self._read(window, before.chat_seq)
-            if not current():
-                return
-            if after is None or after.local["farmer_id"] != before.local["farmer_id"]:
-                self.stop("game_unavailable")
-                return
-            result = _UNKNOWN
-            if confirmed(action, params, before, after, public_text=arguments.get("text")):
-                result = OutputResult("completed", evidence={"source": "stardew_readback", "ref": uuid4().hex})
-            self._last_result = result.status
-            self._work = None
-            work.report(result)
-        except (McpError, asyncio.TimeoutError):
+            await window.client.call(action, arguments, timeout=_ACTION_REQUEST_TIMEOUT, before_write=before_write)
+            while current():
+                after = await self._read(window, before.chat_seq)
+                if not current():
+                    return
+                if after is None or after.local["farmer_id"] != before.local["farmer_id"]:
+                    self.stop("game_unavailable")
+                    return
+                verified = confirmed(action, params, before, after, public_text=arguments.get("text"))
+                stopped = after.action_running is False
+                synchronous = after.action_running is None and work.running_state is None and verified
+                if stopped or synchronous:
+                    result = (OutputResult("completed", evidence={"source": "stardew_readback", "ref": uuid4().hex})
+                              if verified else _UNKNOWN)
+                    self._finish_work(work, result)
+                    return
+                if after.action_running is True:
+                    work.running_state = after
+                await asyncio.sleep(self.poll_interval)
+        except McpError as error:
             if self._window is window:
-                self.stop("mcp_unavailable" if self.clock() < deadline else "expired")
+                if isinstance(error, McpWriteCancelled) and self.clock() >= deadline:
+                    self.stop("expired")
+                else:
+                    self.stop("mcp_unavailable")
 
     def cancel(self, intent, reason):
         work = self._work
@@ -302,20 +324,21 @@ class StardewBridge:
     def _cancel_work(self, window, work):
         with work.lock:
             work.blocked = True
-        if work.task is not None:
+        work.timer.cancel()
+        if work.task is not asyncio.current_task():
             work.task.cancel()
         if work.sent:
-            self._cleanup = asyncio.create_task(self._cancel_and_read(window))
+            self._cleanup = asyncio.create_task(self._cancel_and_read(window, work.running_state))
 
-    async def _cancel_and_read(self, window):
+    async def _cancel_and_read(self, window, running_state):
         try:
-            before = window.state
+            before = running_state or window.state
             await window.client.cancel_action()
             if self._current(window):
                 after = await self._read(window, before.chat_seq)
                 if confirmed("cancel_action", {}, before, after):
                     return OutputResult("completed", evidence={"source": "stardew_readback", "ref": uuid4().hex})
-        except (McpError, asyncio.TimeoutError):
+        except McpError:
             pass
         finally:
             self._cleanup = None
@@ -339,6 +362,8 @@ class StardewBridge:
         if window.seq and not retiring:
             self._publish(window, closed=True)
         self.session.set_game_window(window.game_id, None, 1, deadline=0)
+        if self._work is not None and self._work.window is window:
+            self.cancel({"task_id": self._work.task_id}, reason)
         if window.state is not None:
             if retiring:
                 asyncio.get_running_loop().call_soon(self._withdraw)

@@ -19,6 +19,10 @@ class McpError(Exception):
     pass
 
 
+class McpWriteCancelled(McpError):
+    pass
+
+
 def loopback_endpoint(url):
     if not isinstance(url, str) or any(ord(char) <= 32 for char in url):
         raise ValueError("invalid_mcp_url")
@@ -46,7 +50,7 @@ class _Connection(HTTPConnection):
             self.connect()
             self.live_socket = self.sock
         if self.stopped.is_set() or not self.before_write(data is self.body):
-            raise McpError("request_cancelled")
+            raise McpWriteCancelled("request_cancelled")
         super().send(data)
 
     def stop(self):
@@ -172,6 +176,8 @@ class McpClient:
                     future.set_result((frame, session_id))
             except McpError as error:
                 future.set_exception(error)
+            except TimeoutError:
+                future.set_exception(McpError("mcp_timeout"))
             except (OSError, ValueError, HTTPException, RecursionError):
                 future.set_exception(McpError("invalid_or_disconnected_mcp"))
             finally:
@@ -181,6 +187,8 @@ class McpClient:
         Thread(target=run, daemon=True, name="stardew-mcp-http").start()
         try:
             frame, session_id = await asyncio.wait_for(pending, timeout)
+        except asyncio.TimeoutError:
+            raise McpError("mcp_timeout") from None
         finally:
             connection.stop()
         if notification:

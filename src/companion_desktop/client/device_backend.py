@@ -96,7 +96,8 @@ class DeviceBackend(LegacyBackend):
             except ValueError:
                 self._stardew_disabled = "invalid_config"
                 log.warning("Stardew bridge configuration unavailable")
-        self.session = DesktopSession(self._transport, permissions=permissions, avatar=self.avatar, game=self.stardew)
+        self.session = DesktopSession(self._transport, permissions=permissions, avatar=self.avatar, game=self.stardew,
+                                      game_state=self.stardew is not None)
         self.shared_media = None
         self.media_transport = None
         if cfg.get("shared_media_enabled") is True:
@@ -207,10 +208,10 @@ class DeviceBackend(LegacyBackend):
         if self.stardew is None:
             return {"state": self._stardew_disabled, "public_chat": False, "last_result": None,
                     "authorized": False, "map": None}
-        return {**self.stardew.status, "authorized": self.session.granted_session("game") is not None}
+        return {**self.stardew.status, "authorized": self.session.game_state_session() is not None}
 
     def start_stardew(self):
-        if self.closed or self.stardew is None or self.session.granted_session("game") is None:
+        if self.closed or self.stardew is None or self.session.game_state_session() is None:
             return False
         self.loop.call_soon(self.stardew.open, self.session)
         return True

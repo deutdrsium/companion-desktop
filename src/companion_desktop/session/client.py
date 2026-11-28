@@ -18,8 +18,8 @@ from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, PROTOCOL, Connection
 from companion_desktop.contracts.wire import (
-    HOST_TYPES, MAX_GAME_CHAT_EVENTS, MAX_REQUEST_BYTES, ProtocolError, array, encode_request, fields, message, obj,
-    observation_state, parse, parse_ref,
+    GAME_STATE_FEATURE, GAME_STATE_OFFER, HOST_TYPES, MAX_GAME_CHAT_EVENTS, MAX_REQUEST_BYTES, ProtocolError,
+    array, encode_request, fields, message, obj, observation_state, parse, parse_ref, string,
 )
 from .dispatcher import Dispatcher
 
@@ -252,7 +252,7 @@ class HttpTransport:
 class DesktopSession(_SessionEvents):
     """One event-loop-owned device session. Transport and outputs are injectable."""
 
-    def __init__(self, transport, *, permissions=(), avatar=None, game=None, poll_interval=0.25,
+    def __init__(self, transport, *, permissions=(), avatar=None, game=None, game_state=False, poll_interval=0.25,
                  clock=monotonic):
         super().__init__()
         self._transport = transport
@@ -268,6 +268,8 @@ class DesktopSession(_SessionEvents):
         self._published_revision = 0
         self._published_games = []
         self._game_state = None
+        self._offer_game_state = game_state
+        self._game_state_supported = False
         self._game_granted_at = None
         self._reports = deque()
         self._sends = {}
@@ -294,6 +296,9 @@ class DesktopSession(_SessionEvents):
 
     def capabilities_published(self, revision):
         return self.session is not None and self._published_revision == revision
+
+    def game_state_session(self):
+        return self.granted_session("game") if self._game_state_supported else None
 
     def start(self):
         if self._runner is None or self._runner.done():
@@ -332,7 +337,7 @@ class DesktopSession(_SessionEvents):
             raise ProtocolError("invalid_request")
         if body == self._local_caps:
             return
-        game_only = body.keys() == self._local_caps.keys() and all(
+        game_only = self._game_state_supported and body.keys() == self._local_caps.keys() and all(
             value == self._local_caps[key] for key, value in body.items() if key != "games"
         )
         if body["revision"] <= self._local_caps["revision"] and self._published_revision and not game_only:
@@ -355,10 +360,11 @@ class DesktopSession(_SessionEvents):
         self.dispatcher.set_game_window(game_session_id, window_id, window_revision, deadline=deadline)
 
     def publish_games(self, games):
-        self.publish_capabilities({**self._local_caps, "games": games})
+        if self._game_state_supported:
+            self.publish_capabilities({**self._local_caps, "games": games})
 
     def report_game_state(self, body, *, session):
-        if session is None or session != self.granted_session("game"):
+        if session is None or session != self.game_state_session():
             return False
         body = message("game.state", session, deepcopy(body))["body"]
         pending = self._game_state
@@ -430,12 +436,17 @@ class DesktopSession(_SessionEvents):
 
     async def _register(self):
         requested = self._permissions
-        response = await self._transport("register", {"protocols": [PROTOCOL], "permissions": sorted(requested),
+        protocols = [PROTOCOL]
+        if self._offer_game_state and "game" in requested:
+            protocols.append(GAME_STATE_OFFER)
+        response = await self._transport("register", {"protocols": protocols, "permissions": sorted(requested),
                                                      "activate_on_exchange": True})
         if not fields(response, {"protocol": lambda item: item == PROTOCOL, "session": obj,
-                                 "permissions": array(lambda item: item in PERMISSIONS)}):
+                                 "permissions": array(lambda item: item in PERMISSIONS)},
+                      {"features": array(string)} if GAME_STATE_OFFER in protocols else None):
             raise ProtocolError("invalid_response")
         self.session = parse_ref(response["session"])
+        self._game_state_supported = GAME_STATE_FEATURE in response.get("features", ())
         self._reconfigure = requested != self._permissions
         self._grant = frozenset(response["permissions"]) & self._permissions
         self._published_revision = 0
@@ -446,6 +457,9 @@ class DesktopSession(_SessionEvents):
     def _drop(self, reason):
         self.dispatcher.disconnect(reason)
         self.session = None
+        if self._game_state_supported:
+            self._local_caps = {**self._local_caps, "games": []}
+        self._game_state_supported = False
         self._reports.clear()
         self._game_state = None
         self._game_granted_at = None
@@ -479,13 +493,14 @@ class DesktopSession(_SessionEvents):
             self._reports.popleft()
         if operation == "exchange":
             game_state = self._game_state
-            if game_state is not None and self.granted_session("game") != ref:
+            if game_state is not None and self.game_state_session() != ref:
                 self._game_state = game_state = None
             if game_state is not None and not game_state["window_ttl_ms"]:
                 if append(message("game.state", ref, game_state)):
                     self._game_state = None
                 game_state = None
-            caps_pending = caps["revision"] != self._published_revision or caps["games"] != self._published_games
+            caps_pending = (caps["revision"] != self._published_revision
+                            or (self._game_state_supported and caps["games"] != self._published_games))
             caps_ready = not caps_pending or append(message("capabilities", ref, caps)) is True
             for kind, work in (("turn.cancel", self._cancels), ("turn.send", self._sends)):
                 for key, value in tuple(work.items()):

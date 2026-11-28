@@ -7,11 +7,11 @@ from threading import Event, Thread
 import pytest
 
 from companion_desktop.contracts.types import PROTOCOL
-from companion_desktop.contracts.wire import CLIENT_TYPES, ProtocolError, message
+from companion_desktop.contracts.wire import CLIENT_TYPES, GAME_STATE_OFFER, ProtocolError, message
 from companion_desktop.games.stardew.adapter import StardewBridge
-from companion_desktop.games.stardew.mcp_client import McpClient
+from companion_desktop.games.stardew.mcp_client import McpClient, McpError
 from companion_desktop.session.client import DesktopSession
-from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost
+from plugins.astrbot_plugin_desktop_access.session import Binding, SessionHost, TurnResult
 
 
 REF = {"device_id": "device-demo", "desktop_session_id": "session-demo", "generation": 1}
@@ -32,6 +32,7 @@ class MockMcp:
         self.tools = ["get_coop_state", "map_info", "get_state", "move_to", "use_tool", "emote",
                       "say_public", "say", "cancel_action", "buy", "drop_item", "use_bomb", "toggle_ai"]
         self.block_action = False
+        self.accept_async = False
         self.fail_action = False
         self.ignore_move = False
         self.reads_blocked = False
@@ -69,6 +70,9 @@ class MockMcp:
             return {}
         if self.fail_action:
             return None
+        if self.accept_async:
+            self.state["actionRunning"] = True
+            return {"content": [{"type": "text", "text": "accepted"}]}
         if self.block_action:
             self.state["actionRunning"] = True
             self.release_action.wait(2)
@@ -174,6 +178,17 @@ def test_streamable_http_handshake_and_json_sse_tools(mcp, monkeypatch):
     ]
 
 
+def test_transport_timeout_has_mcp_error(mcp):
+    async def run():
+        client = McpClient(mcp.url)
+        await client.initialize()
+        mcp.reads_blocked = True
+        with pytest.raises(McpError, match="mcp_timeout"):
+            await client.call("get_coop_state", {"after_seq": 0}, timeout=0.05)
+
+    asyncio.run(run())
+
+
 async def wait_for(condition):
     for _ in range(400):
         value = condition()
@@ -184,19 +199,21 @@ async def wait_for(condition):
 
 
 class Rig:
-    def __init__(self, mcp, *, grants=("speak", "game"), clock=None):
+    def __init__(self, mcp, *, grants=("speak", "game"), clock=None, host_type=SessionHost):
         clocks = {} if clock is None else {"clock": clock}
         self.bridge = StardewBridge(mcp.url, [[6, 5]], poll_interval=0.02, **clocks)
         self.binding = Binding("device-demo", "binding-demo", frozenset(grants))
-        self.host = SessionHost(**clocks)
-        self.frames, self.receipts, self.registrations = [], {}, []
+        self.host = host_type(**clocks)
+        self.frames, self.receipts, self.registrations, self.exchanges = [], {}, [], []
         self.disconnect = False
-        self.desktop = DesktopSession(self.transport, permissions={"game", "speak"}, game=self.bridge,
+        self.desktop = DesktopSession(self.transport, permissions={"game", "speak"}, game=self.bridge, game_state=True,
                                       poll_interval=0.02, **clocks)
 
     async def transport(self, operation, payload):
         if operation == "register":
             self.registrations.append(payload)
+        if operation == "exchange":
+            self.exchanges.append(payload)
         if self.disconnect:
             raise ConnectionError("connection_lost")
         for frame in payload.get("messages", ()):
@@ -285,6 +302,53 @@ def test_opt_in_without_game_grant_never_contacts_mcp(mcp):
     asyncio.run(run())
 
 
+class LegacyV1Host(SessionHost):
+    def _register(self, binding, payload):
+        assert PROTOCOL in payload["protocols"]
+        return super()._register(binding, {**payload, "protocols": [PROTOCOL]})
+
+    def _update_capabilities(self, connection, body):
+        if connection.capabilities is not None and body["revision"] <= connection.capabilities["revision"]:
+            if body != connection.capabilities:
+                raise ProtocolError("stale_capabilities")
+        super()._update_capabilities(connection, body)
+
+    def _game_state(self, connection, frame, on_message):
+        raise ProtocolError("invalid_body")
+
+
+def test_legacy_v1_host_preserves_generation_and_conversation(mcp):
+    async def run():
+        turn_texts = []
+
+        class Chat:
+            async def run(self, turn_id, text):
+                turn_texts.append(text)
+                return TurnResult("completed", "Test reply")
+
+        class HostWithChat(LegacyV1Host):
+            def handle(self, binding, operation, payload, **kwargs):
+                return super().handle(binding, operation, payload, turns=Chat(), **kwargs)
+
+        async with Rig(mcp, host_type=HostWithChat) as rig:
+            ref = rig.desktop.session
+            events = []
+            rig.desktop.subscribe(events.append)
+            assert rig.registrations[0]["protocols"] == [PROTOCOL, GAME_STATE_OFFER]
+            assert rig.desktop.granted_session("game") == ref
+            assert not rig.bridge.open(rig.desktop)
+            rig.desktop.publish_games([{"game_session_id": "game-demo", "capability_revision": 1, "actions": []}])
+            assert not rig.desktop.report_game_state(None, session=ref)
+            rig.desktop.send_message("local-chat", "Fixture message")
+            await wait_for(lambda: any(event["type"] == "turn.completed" for event in events))
+            assert rig.desktop.session == ref and len(rig.registrations) == 1
+            assert turn_texts == ["Fixture message"] and not mcp.calls
+            assert all(frame["type"] != "game.state" for payload in rig.exchanges for frame in payload["messages"])
+            assert not rig.host.capabilities(ref)["games"]
+
+    asyncio.run(run())
+
+
 def test_unstructured_chat_disables_public_tool_even_if_listed(mcp):
     async def run():
         mcp.state["chatEvents"] = [{"seq": 1, "farmerName": "Example", "text": "PRIVATE_CHAT_MARKER"}]
@@ -329,6 +393,51 @@ def test_white_list_and_readback_over_local_mcp(mcp):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("event", ["complete", "cancel_intent", "cancel_action", "stop", "revoke", "disconnect", "expire"])
+def test_acknowledged_running_action_stays_owned_until_finished_or_cancelled(mcp, event):
+    async def run():
+        mcp.accept_async = True
+        async with Rig(mcp) as rig:
+            assert rig.bridge.open(rig.desktop)
+            await wait_for(lambda: rig.frames)
+            ref = rig.desktop.session
+            rig.send("move_to", {"map": "Farm", "x": 5, "y": 4}, ttl_ms=500 if event == "expire" else 5000)
+            await wait_for(lambda: rig.bridge._work and rig.bridge._work.running_state)
+            await rig.receipt("move_to", "running")
+            rig.send("emote", {"emote": "hi"})
+            assert (await rig.receipt("emote", "rejected"))["reason_code"] == "busy"
+            if event == "complete":
+                mcp.state["farmers"][0]["x"] = 5
+                mcp.state["actionRunning"] = False
+                await rig.receipt("move_to", "completed")
+                assert ("cancel_action", {}) not in mcp.calls
+                return
+            if event == "cancel_intent":
+                rig.host.cancel_intent(ref, task_id="move_to")
+                rig.host.cancel_intent(ref, task_id="move_to")
+            elif event == "cancel_action":
+                rig.send("cancel_action", {})
+            elif event == "stop":
+                rig.bridge.stop()
+            elif event == "revoke":
+                rig.binding = Binding("device-demo", "binding-demo", frozenset({"speak"}))
+            elif event == "disconnect":
+                rig.disconnect = True
+            await wait_for(lambda: ("cancel_action", {}) in mcp.calls)
+            if event != "disconnect":
+                await rig.receipt("move_to", "unknown")
+            if event == "cancel_action":
+                await rig.receipt("cancel_action", "completed")
+            if event == "expire":
+                assert rig.bridge.status["state"] == "expired"
+            rig.bridge.stop()
+            await rig.bridge.close()
+            assert sum(name == "move_to" for name, _ in mcp.calls) == 1
+            assert sum(name == "cancel_action" for name, _ in mcp.calls) == 1
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("cause", ["reconnect", "revocation", "takeover", "cancel", "mcp_drop", "ttl"])
 def test_interrupts_inflight_once_and_marks_unknown(mcp, cause):
     async def run():
@@ -362,6 +471,8 @@ def test_interrupts_inflight_once_and_marks_unknown(mcp, cause):
             if cause == "ttl":
                 assert rig.bridge.status["state"] == "expired"
                 assert not rig.desktop.device_capabilities["games"]
+            if cause == "mcp_drop":
+                assert rig.bridge.status["state"] == "mcp_unavailable"
             assert sum(name == "move_to" for name, _ in mcp.calls) == 1
             assert sum(name == "cancel_action" for name, _ in mcp.calls) == 1
 

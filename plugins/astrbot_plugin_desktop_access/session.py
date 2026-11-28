@@ -13,7 +13,10 @@ from typing import Protocol
 from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, TERMINAL_STATUSES
-from companion_desktop.contracts.wire import CLIENT_TYPES, ProtocolError, array, fields, message, negotiate, obj, parse, parse_ref, string
+from companion_desktop.contracts.wire import (
+    CLIENT_TYPES, GAME_STATE_FEATURE, GAME_STATE_OFFER, ProtocolError, array, fields, message, negotiate,
+    obj, parse, parse_ref, string,
+)
 from companion_desktop.session.dispatcher import OutputResult, result_body, task_parameters, unavailable
 
 BATCH_LIMIT = 32
@@ -97,6 +100,7 @@ class _Connection:
     ref: dict
     permissions: frozenset[str]
     expires: float
+    game_state_supported: bool = False
     lease: asyncio.TimerHandle | None = None
     capabilities: dict | None = None
     windows: dict = field(default_factory=dict)
@@ -202,13 +206,14 @@ class SessionHost:
                       {"activate_on_exchange": lambda value: value is True}):
             raise ProtocolError("invalid_request")
         protocol = negotiate(payload["protocols"])
+        game_state_supported = GAME_STATE_OFFER in payload["protocols"]
         granted = binding.permissions & frozenset(payload["permissions"])
         self._generation += 1
         ref = {"device_id": binding.device_id, "desktop_session_id": uuid4().hex,
                "generation": self._generation}
         now = self.clock()
         connection = _Connection(Binding(binding.device_id, binding.key, granted), ref, granted,
-                                 now + self.lease_seconds)
+                                 now + self.lease_seconds, game_state_supported=game_state_supported)
         if payload.get("activate_on_exchange"):
             pending = self._pending_registrations.setdefault(binding.device_id, {})
             for generation, candidate in tuple(pending.items()):
@@ -219,7 +224,10 @@ class SessionHost:
             pending[ref["generation"]] = connection
         else:
             self._activate(connection)
-        return {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
+        response = {"protocol": protocol, "session": dict(ref), "permissions": sorted(granted)}
+        if game_state_supported:
+            response["features"] = [GAME_STATE_FEATURE]
+        return response
 
     def _activate(self, connection):
         binding = connection.binding
@@ -247,7 +255,8 @@ class SessionHost:
         if current is not None and body["revision"] <= current["revision"]:
             if body == current:
                 return
-            if body.keys() != current.keys() or any(value != current[key] for key, value in body.items() if key != "games"):
+            if (not connection.game_state_supported or body.keys() != current.keys()
+                    or any(value != current[key] for key, value in body.items() if key != "games")):
                 raise ProtocolError("stale_capabilities")
         if current is not None and current["revision"] != body["revision"]:
             self._invalidate_scopes(connection, {"avatar"}, "capabilities_changed")
@@ -291,7 +300,7 @@ class SessionHost:
     def _game_state(self, connection, frame, on_message):
         body = frame["body"]
         game_id = body["game_session_id"]
-        if ("game" not in connection.permissions or connection.capabilities is None
+        if (not connection.game_state_supported or "game" not in connection.permissions or connection.capabilities is None
                 or not any(game["game_session_id"] == game_id for game in connection.capabilities["games"])):
             return
         revision, window_id, seq = body["window_revision"], body["window_id"], body["seq"]
