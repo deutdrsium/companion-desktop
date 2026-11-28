@@ -1,6 +1,7 @@
 import asyncio
 from base64 import b64decode
 from io import BytesIO
+from json import loads
 from random import Random
 from threading import Event, get_ident
 from time import perf_counter, sleep
@@ -178,7 +179,7 @@ def test_glance_limits_survive_restart(qapp, monkeypatch, tmp_path):
         assert asyncio.run(relaunch()) == count
 
 
-@pytest.mark.parametrize("invalidate", ["opt_out", "stop", "new_revision", "new_media"])
+@pytest.mark.parametrize("invalidate", ["opt_out", "stop", "new_revision", "new_media", "budget_changed"])
 def test_delayed_http_worker_rechecks_before_sending(qapp, monkeypatch, invalidate):
     monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
     connecting, release, finished = Event(), Event(), Event()
@@ -231,43 +232,107 @@ def test_delayed_http_worker_rechecks_before_sending(qapp, monkeypatch, invalida
                 media.stop()
             elif invalidate == "new_revision":
                 media._seq += 1
-            else:
+            elif invalidate == "new_media":
                 media._desired_id = "0" * 32
+            else:
+                media._glance_rate = (-1, 599)
         finally:
             release.set()
         assert await asyncio.to_thread(finished.wait, 2)
         assert not writes
+        assert media._glance_budget(0) is (invalidate != "budget_changed")
         await media.close()
 
     asyncio.run(run())
 
 
+class OkResponse(BytesIO):
+    code = status = 200
+    reason = "OK"
+    msg = {}
+
+    def info(self):
+        return {}
+
+
 def test_guarded_http_dispatch_writes_authenticated_body(monkeypatch):
     writes = []
-
-    class Socket:
-        def sendall(self, data):
-            writes.append(data)
-
-        def close(self):
-            pass
-
-    class Response(BytesIO):
-        code = status = 200
-        reason = "OK"
-        msg = {}
-
-        def info(self):
-            return {}
+    checks = []
 
     def connect(connection):
-        connection.sock = Socket()
+        connection.sock = SimpleNamespace(sendall=writes.append, close=lambda: None)
 
     monkeypatch.setattr(client.HTTPConnection, "connect", connect)
-    monkeypatch.setattr(client.HTTPConnection, "getresponse", lambda _: Response(b'{"status":"ok","data":1}'))
+    monkeypatch.setattr(client.HTTPConnection, "getresponse", lambda _: OkResponse(b'{"status":"ok","data":1}'))
     transport = client.HttpTransport("http://127.0.0.1:1/desktop/shared-media/glance", "synthetic")
-    assert asyncio.run(transport.request(b"test body", before_send=lambda: True)) == 1
+
+    def before_send(writing_body):
+        checks.append((writing_body, len(writes)))
+        return True
+
+    assert asyncio.run(transport.request(b"test body", before_send=before_send)) == 1
+    assert checks == [(False, 0), (False, 0), (True, 1)]
     assert b"Authorization: Bearer synthetic" in writes[0] and b"".join(writes).endswith(b"test body")
+
+
+def test_glance_rate_starts_at_delayed_first_body_write(qapp, monkeypatch, tmp_path):
+    monkeypatch.setattr(shared_media, "LocalPlayer", LocalSource)
+    now = [0]
+    headers, release = Event(), Event()
+    writes = []
+    wall_start = 1_800_000_000
+    monkeypatch.setattr(shared_media, "time", lambda: wall_start + now[0])
+
+    def sendall(data):
+        if data.startswith(b"POST "):
+            if not writes:
+                headers.set()
+                if not release.wait(3):
+                    raise TimeoutError()
+        else:
+            writes.append((now[0], loads(data)["payload"]["reason"]))
+
+    def connect(connection):
+        connection.sock = SimpleNamespace(sendall=sendall, close=lambda: None)
+
+    monkeypatch.setattr(client.HTTPConnection, "connect", connect)
+    monkeypatch.setattr(client.HTTPConnection, "getresponse", lambda _: OkResponse(b'{"status":"ok"}'))
+    backend = SimpleNamespace(base="http://127.0.0.1:1", api="/desktop", key="synthetic", media_transport=None)
+
+    async def run():
+        host = MediaHost()
+
+        async def send(operation, ref, payload, **kwargs):
+            if operation == "glance":
+                return await DeviceBackend._shared_media_request(backend, operation, ref, payload, **kwargs)
+            return await host(operation, ref, payload)
+
+        store = QSettings(str(tmp_path / "prefs.ini"), QSettings.IniFormat)
+        media = shared_media.SharedMedia(asyncio.get_running_loop(), send, lambda: REF, clock=lambda: now[0])
+        media.set_frame_glance(True, store=store)
+        assert media.start("local_player", "movie")
+        media.local_player.frame_sampled.emit(frame("blue"))
+        media.local_player.set_item(status="paused")
+        try:
+            assert await asyncio.to_thread(headers.wait, 2)
+            assert store.value("frame_glance_last") is None
+            now[0] = 1.5
+        finally:
+            release.set()
+        await settle_glance(media)
+        assert writes == [(1.5, "pause")]
+        assert store.value("frame_glance_last", type=float) == wall_start + 1.5
+
+        for at, count in ((180, 1), (181.5, 2), (600, 2), (601.5, 3)):
+            now[0] = at
+            media.set_owner_speaking(True)
+            media.set_owner_speaking(False)
+            await settle_glance(media)
+            assert len(writes) == count
+        assert [at for at, _ in writes] == [1.5, 181.5, 601.5]
+        await media.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(("url", "allowed"), [

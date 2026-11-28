@@ -157,16 +157,19 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class _GuardedConnection:
-    def __init__(self, host, *, before_send, **kwargs):
+    def __init__(self, host, *, body, before_send, **kwargs):
         super().__init__(host, **kwargs)
+        self.body = body
         self.before_send = before_send
 
     def send(self, data):
-        if not self.before_send():
-            raise ProtocolError("stale_glance")
         if self.sock is None:
+            if not self.before_send(False):
+                raise ProtocolError("stale_glance")
             self.connect()
-        if not self.before_send():
+        # Opt-out blocks subsequent writes. A write already inside sendall can finish;
+        # the host rejects stale revisions or disabled glances.
+        if not self.before_send(data is self.body):
             raise ProtocolError("stale_glance")
         super().send(data)
 
@@ -181,12 +184,13 @@ class _GuardedHTTPSConnection(_GuardedConnection, HTTPSConnection):
 
 class _GuardedHTTPHandler(HTTPHandler):
     def http_open(self, req):
-        return self.do_open(partial(_GuardedHTTPConnection, before_send=req.before_send), req)
+        return self.do_open(partial(_GuardedHTTPConnection, body=req.data, before_send=req.before_send), req)
 
 
 class _GuardedHTTPSHandler(HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(partial(_GuardedHTTPSConnection, before_send=req.before_send), req, context=self._context)
+        connection = partial(_GuardedHTTPSConnection, body=req.data, before_send=req.before_send)
+        return self.do_open(connection, req, context=self._context)
 
 
 class HttpTransport:

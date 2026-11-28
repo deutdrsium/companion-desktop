@@ -2,7 +2,7 @@
 
 import asyncio
 from math import isfinite
-from threading import Event
+from threading import Event, Lock
 from time import monotonic, time
 from uuid import uuid4
 
@@ -69,7 +69,8 @@ class SharedMedia(QObject):
         self._frame_glance = False
         self._glance_frame = self._glance_pending = self._glance_task = None
         self._glance_signature_task = None
-        self._last_glance = self._glance_budget_at = float("-inf")
+        self._glance_rate = (float("-inf"), float("-inf"))
+        self._glance_rate_lock = Lock()
         self._glance_store = None
         self._glance_token = None
         self.glance_transport_allowed = lambda: True
@@ -245,8 +246,8 @@ class SharedMedia(QObject):
             if last > 0 and isfinite(last) and isfinite(budget_at):
                 wall_now, now = time(), self.clock()
                 elapsed = max(0, wall_now - last)
-                self._last_glance = now - elapsed
-                self._glance_budget_at = now - elapsed + min(2 * GLANCE_AVERAGE_SECONDS, budget_at - last)
+                last_glance = now - elapsed
+                self._glance_rate = last_glance, last_glance + min(2 * GLANCE_AVERAGE_SECONDS, budget_at - last)
         self._frame_glance = enabled is True
         self._update_frame_sampling()
 
@@ -308,17 +309,13 @@ class SharedMedia(QObject):
             self._glance_signature_task = None
 
     def _glance_budget(self, now):
-        return (now - self._last_glance >= GLANCE_MIN_SECONDS
-                and now >= self._glance_budget_at - GLANCE_AVERAGE_SECONDS)
+        last, budget_at = self._glance_rate
+        return now - last >= GLANCE_MIN_SECONDS and now >= budget_at - GLANCE_AVERAGE_SECONDS
 
-    def _reserve_glance(self, now):
-        self._last_glance = now
-        self._glance_budget_at = max(now, self._glance_budget_at) + GLANCE_AVERAGE_SECONDS
-        if self._glance_store is not None:
-            wall_now = time()
-            self._glance_store.setValue("frame_glance_last", wall_now)
-            self._glance_store.setValue("frame_glance_budget_at", wall_now + (self._glance_budget_at - now))
-            self._glance_store.sync()
+    def _save_glance_rate(self, wall_last, wall_budget_at):
+        self._glance_store.setValue("frame_glance_last", wall_last)
+        self._glance_store.setValue("frame_glance_budget_at", wall_budget_at)
+        self._glance_store.sync()
 
     def _offer_glance(self, reason):
         item, now = self._item, self.clock()
@@ -684,17 +681,28 @@ class SharedMedia(QObject):
                     and self._ref == ref and self._desired_id == self._remote_id == media_id
                     and self.clock() - at < GLANCE_MAX_AGE)
 
+        def before_send(writing_body):
+            with self._glance_rate_lock:
+                now = self.clock()
+                if not current() or not self._glance_budget(now):
+                    return False
+                if writing_body:
+                    budget_at = max(now, self._glance_rate[1]) + GLANCE_AVERAGE_SECONDS
+                    if self._glance_store is not None:
+                        wall_now = time()
+                        self.loop.call_soon_threadsafe(self._save_glance_rate, wall_now, wall_now + (budget_at - now))
+                    self._glance_rate = now, budget_at
+                return True
+
         try:
             self._read_local()
             if not current():
                 return
             encoded = await asyncio.to_thread(frame.jpeg)
-            now = self.clock()
-            if encoded is None or not current() or not self._glance_budget(now):
+            if encoded is None or not before_send(False):
                 return
-            self._reserve_glance(now)
             await self._request("glance", ref, {"media_id": media_id, "seq": seq, "reason": reason, "image": encoded},
-                                before_send=current)
+                                before_send=before_send)
         except (ProtocolError, ConnectionError, TimeoutError):
             pass
         finally:

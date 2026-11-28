@@ -118,8 +118,10 @@ class DeviceBackend(LegacyBackend):
         if len(data) > limit:
             raise ProtocolError("invalid_request")
         if operation == "glance":
-            return await self.media_transport.request(
-                data, before_send=lambda: endpoint == self.base + self.api + "/shared-media/glance" and before_send())
+            def current(writing_body):
+                return endpoint == self.base + self.api + "/shared-media/glance" and before_send(writing_body)
+
+            return await self.media_transport.request(data, before_send=current)
         return await self.media_transport.request(data)
 
     def _media_pose(self, event):

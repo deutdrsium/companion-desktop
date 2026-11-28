@@ -57,7 +57,7 @@ class MediaHost:
 
     async def __call__(self, operation, ref, payload, *, before_send=None):
         assert ref == REF
-        if before_send is not None and not before_send():
+        if before_send is not None and not before_send(True):
             raise ProtocolError("stale_glance")
         self.calls.append((operation, payload))
         if operation == "status":
@@ -459,7 +459,7 @@ def test_shared_media_http_uses_existing_authenticated_transport(monkeypatch):
 
         async def request(self, body, *, before_send=None):
             if before_send is not None:
-                assert before_send()
+                assert before_send(True)
             sent.append((self.endpoint, json.loads(body)))
             return {"state": {"status": "idle", "seq": -1, "media_id": None}, "reaction": None}
 
@@ -469,14 +469,14 @@ def test_shared_media_http_uses_existing_authenticated_transport(monkeypatch):
         request = device_backend.DeviceBackend._shared_media_request
         await request(backend, "status", REF, {})
         payload = {"media_id": "0" * 32, "seq": 7, "reason": "pause", "image": "A" * 106_668}
-        await request(backend, "glance", REF, payload, before_send=lambda: True)
+        await request(backend, "glance", REF, payload, before_send=lambda _: True)
         with pytest.raises(ProtocolError, match="invalid_request"):
             await request(backend, "comment", REF, {"cue": "A" * 8192})
         with pytest.raises(ProtocolError, match="invalid_request"):
-            await request(backend, "glance", REF, {**payload, "image": "A" * (128 * 1024)}, before_send=lambda: True)
+            await request(backend, "glance", REF, {**payload, "image": "A" * (128 * 1024)}, before_send=lambda _: True)
         backend.base = "http://192.0.2.1"
         with pytest.raises(ProtocolError, match="glance_unavailable"):
-            await request(backend, "glance", REF, payload, before_send=lambda: True)
+            await request(backend, "glance", REF, payload, before_send=lambda _: True)
         return payload
 
     payload = asyncio.run(run())
