@@ -35,8 +35,8 @@ for f in [Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Windows/Fonts/FZ
 from companion_desktop.client.controller import Controller  # noqa: E402
 from companion_desktop.ui import theme  # noqa: E402
 from companion_desktop.ui.observe import ConsentDialog  # noqa: E402
-from companion_desktop.ui.paint import Animated, Character  # noqa: E402
-from companion_desktop.ui.settings import Prefs, SettingsWindow  # noqa: E402
+from companion_desktop.ui.paint import Animated, Character, Toggle  # noqa: E402
+from companion_desktop.ui.settings import GLANCE_LABEL, Prefs, SettingsWindow  # noqa: E402
 from companion_desktop.ui.splash import LaunchCard  # noqa: E402
 from companion_desktop.ui.panel import Panel  # noqa: E402
 from companion_desktop.ui.session_state import SessionState  # noqa: E402
@@ -217,6 +217,9 @@ def main():
     w.show()
     w.show_page(5)
     save(w, "settings-together")
+    next(toggle for toggle in w.findChildren(Toggle) if toggle.accessibleName() == GLANCE_LABEL).click()
+    save(w, "settings-together-glance-enabled")
+    c.prefs.set("together_frame_glance", False)
     render_together(c.prefs)
     tray = Tray(CHAR, "桌面陪伴", c.state)
     tray.menu.adjustSize()

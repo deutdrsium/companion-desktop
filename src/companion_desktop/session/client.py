@@ -6,12 +6,14 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from copy import deepcopy
+from functools import partial
+from http.client import HTTPConnection, HTTPSConnection
 from math import ceil
 from threading import Thread
 from time import monotonic
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPHandler, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
 
 from companion_desktop.contracts.types import PERMISSIONS, PROTOCOL, Connection
@@ -154,6 +156,43 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class _GuardedConnection:
+    def __init__(self, host, *, body, before_send, **kwargs):
+        super().__init__(host, **kwargs)
+        self.body = body
+        self.before_send = before_send
+
+    def send(self, data):
+        if self.sock is None:
+            if not self.before_send(False):
+                raise ProtocolError("stale_glance")
+            self.connect()
+        # Opt-out blocks subsequent writes. A write already inside sendall can finish;
+        # the host rejects stale revisions or disabled glances.
+        if not self.before_send(data is self.body):
+            raise ProtocolError("stale_glance")
+        super().send(data)
+
+
+class _GuardedHTTPConnection(_GuardedConnection, HTTPConnection):
+    pass
+
+
+class _GuardedHTTPSConnection(_GuardedConnection, HTTPSConnection):
+    pass
+
+
+class _GuardedHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(partial(_GuardedHTTPConnection, body=req.data, before_send=req.before_send), req)
+
+
+class _GuardedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        connection = partial(_GuardedHTTPSConnection, body=req.data, before_send=req.before_send)
+        return self.do_open(connection, req, context=self._context)
+
+
 class HttpTransport:
     """POST to the authenticated plugin route without making exit wait for socket I/O."""
 
@@ -163,11 +202,18 @@ class HttpTransport:
         self.timeout = timeout
         self._opener = build_opener(_NoRedirect())
 
-    def _call(self, data):
-        req = Request(self.endpoint, data=data,
-                      headers={"Authorization": "Bearer " + self._credential, "Content-Type": "application/json"})
+    def _call(self, data, before_send=None):
+        headers = {"Authorization": "Bearer " + self._credential, "Content-Type": "application/json"}
+        req = Request(self.endpoint, data=data, headers=headers)
+        opener = self._opener
+        if before_send is not None:
+            req.before_send = before_send
+            handlers = [_NoRedirect(), _GuardedHTTPHandler(), _GuardedHTTPSHandler()]
+            if req.type == "http":
+                handlers.append(ProxyHandler({}))
+            opener = build_opener(*handlers)
         try:
-            with self._opener.open(req, timeout=self.timeout) as response:
+            with opener.open(req, timeout=self.timeout) as response:
                 result = json.load(response)
         except HTTPError as exc:
             if exc.code in (401, 403, 404):
@@ -184,14 +230,14 @@ class HttpTransport:
     async def __call__(self, operation, payload):
         return await self.request(encode_request(operation, payload))
 
-    async def request(self, data):
+    async def request(self, data, *, before_send=None):
         result = Future()
 
         def run():
             if not result.set_running_or_notify_cancel():
                 return
             try:
-                result.set_result(self._call(data))
+                result.set_result(self._call(data) if before_send is None else self._call(data, before_send))
             except Exception as error:
                 result.set_exception(error)
 

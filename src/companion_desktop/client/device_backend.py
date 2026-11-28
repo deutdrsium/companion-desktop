@@ -16,6 +16,7 @@ from ..avatar.procedural import ProceduralAvatar
 from ..avatar.vts import VTSOutput
 from ..contracts.wire import ProtocolError
 from ..session.client import DesktopSession, HttpTransport
+from .connection import frame_glance_allowed
 from .legacy_backend import LegacyBackend
 
 log = logging.getLogger(__name__)
@@ -90,6 +91,7 @@ class DeviceBackend(LegacyBackend):
 
             self.shared_media = SharedMedia(self.loop, self._shared_media_request,
                                             lambda: self.session.granted_session("speak"), self)
+            self.shared_media.glance_transport_allowed = lambda: frame_glance_allowed(self.base + self.api)
             if self.avatar is not None:
                 self.shared_media.tier.connect(self._media_pose)
         self.session.subscribe(self._event)
@@ -101,14 +103,25 @@ class DeviceBackend(LegacyBackend):
             self.transport = HttpTransport(endpoint, self.key, timeout=30)
         return await self.transport(operation, payload)
 
-    async def _shared_media_request(self, operation, ref, payload):
+    async def _shared_media_request(self, operation, ref, payload, *, before_send=None):
         endpoint = self.base + self.api + "/shared-media"
+        limit = 8192
+        if operation == "glance":
+            endpoint += "/glance"
+            if not frame_glance_allowed(endpoint) or before_send is None:
+                raise ProtocolError("glance_unavailable")
+            limit = 128 * 1024
         if self.media_transport is None or self.media_transport.endpoint != endpoint:
             self.media_transport = HttpTransport(endpoint, self.key, timeout=12)
         data = json.dumps({"operation": operation, "session": ref, "payload": payload},
                           ensure_ascii=False, allow_nan=False).encode("utf-8")
-        if len(data) > 8192:
+        if len(data) > limit:
             raise ProtocolError("invalid_request")
+        if operation == "glance":
+            def current(writing_body):
+                return endpoint == self.base + self.api + "/shared-media/glance" and before_send(writing_body)
+
+            return await self.media_transport.request(data, before_send=current)
         return await self.media_transport.request(data)
 
     def _media_pose(self, event):

@@ -19,6 +19,7 @@ from ..ui.session_state import SessionState
 from ..ui.settings import SettingsWindow
 from ..ui.together import Together
 from .audio import PcmClip
+from .connection import frame_glance_allowed
 from .protocol import desktop_locked, sentences, visible_text, vts_running
 from .timeline import CueTrack, PlaybackLevel
 
@@ -87,6 +88,7 @@ class Controller(QObject):
         self.guard.timeout.connect(self._guard)
         self._wire()
         if self.shared_media is not None:
+            self.shared_media.set_frame_glance(prefs.get("together_frame_glance"), store=prefs.store)
             self.shared_media.can_present = self._media_ready
             self.shared_media.reaction.connect(self._play_media_reaction)
             self.shared_media.reaction_cancelled.connect(self._cancel_media_reaction)
@@ -102,6 +104,7 @@ class Controller(QObject):
         self.together = Together(self.shared_media, self.panel, prefs, self.state, character.name, off,
                                  presented=lambda reaction_id: reaction_id == self._media_reaction_id)
         self.together.active_changed.connect(self._together_active)
+        self._update_glance_settings()
 
     # ------------------------------------------------------------ wiring
     def _wire(self):
@@ -228,6 +231,7 @@ class Controller(QObject):
             self.settings = s
         self.settings.set_observe_switches(self.periodic, False)
         self.settings.set_together_note(self.together.reason(ignore_pref=True))
+        self._update_glance_settings()
         self.settings.show_page(page)
         self.settings.show()
         self.settings.raise_()
@@ -262,6 +266,8 @@ class Controller(QObject):
             self.player.set_volume(value)
         elif key.startswith("subtitle_"):
             self._subtitle_style()
+        elif key == "together_frame_glance" and self.shared_media is not None:
+            self.shared_media.set_frame_glance(value)
         elif key == "voice_enabled" and not value:
             if self.device and (self.reading is not None or self._media_reaction_id is not None):
                 self.stop()
@@ -796,6 +802,9 @@ class Controller(QObject):
 
     def _link_up(self, base):
         self.backend.set_base(base)
+        if self.shared_media is not None:
+            self.shared_media.set_frame_glance(self.prefs.get("together_frame_glance"))
+        self._update_glance_settings()
         stamp = time.strftime("%H:%M")
         self.panel.chat.add_note("idle", f"{stamp} 已重新连上")
         self.panel.flash("idle", f"已重新连上 · {stamp}")
@@ -810,6 +819,13 @@ class Controller(QObject):
                 bubble.set_receipt("queued")
                 bubble.meta_label.setText("等她回答后再发")
                 self.outbox.append(bubble)
+
+    def _update_glance_settings(self):
+        base = getattr(self.backend, "base", "")
+        allowed = not base or frame_glance_allowed(base + getattr(self.backend, "api", ""))
+        self.together.set_frame_glance_available(allowed)
+        if self.settings is not None:
+            self.settings.set_frame_glance_available(allowed)
 
     def reconnect_now(self):
         if self.device:

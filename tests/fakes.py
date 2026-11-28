@@ -153,6 +153,7 @@ class FakeMedia(QObject):
         self.system = [{"id": "s1", "source": "system_media", "label": "Spotify.exe"}]
         self.local_player = type("LP", (), {})()
         self.local_player.player = FakeQPlayer(self)
+        self.local_player.set_video_output = self.local_player.player.setVideoOutput
 
     @property
     def sources(self):
