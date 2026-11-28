@@ -577,9 +577,11 @@ class SettingsWindow(QWidget):
         self.together_source = source
         self.together_note = label("", "caption", theme.ERROR_FG, wrap=True)
         self.together_note.hide()
-        glance = self._toggle("together_frame_glance", GLANCE_LABEL)
-        privacy = label(together_privacy(glance.isChecked()), "body", "ink2", wrap=True)
-        glance.toggled.connect(lambda enabled: privacy.setText(together_privacy(enabled)))
+        self.glance_toggle = self._toggle("together_frame_glance", GLANCE_LABEL)
+        self.glance_note = label("", "caption", theme.ERROR_FG, wrap=True)
+        self.glance_note.hide()
+        self.glance_privacy = label(together_privacy(self.glance_toggle.isChecked()), "body", "ink2", wrap=True)
+        self.glance_toggle.toggled.connect(self._update_glance_privacy)
         return [label("一起听看", "title"),
                 label(f"听歌或看电影时，{name}可以陪着你，偶尔轻声说一两句。每次都要你自己点开始。",
                       "body", "ink2", wrap=True),
@@ -587,9 +589,18 @@ class SettingsWindow(QWidget):
                      "关掉后面板和托盘里的入口只会说明为什么不能用；正在进行的会立即结束。"),
                 _row("默认来源", source, "桌面播放器：在面板里选一个本地文件，可加 SRT 字幕或 LRC 歌词。"
                      "正在播放的软件：跟着 Windows 报告的播放器，只读状态，不替它控制播放。"),
-                _row(GLANCE_LABEL, glance, GLANCE_PRIVACY),
-                self.together_note, hline(),
-                label("会发送什么", "body", bold=True), privacy]
+                _row(GLANCE_LABEL, self.glance_toggle, GLANCE_PRIVACY),
+                self.glance_note, self.together_note, hline(),
+                label("会发送什么", "body", bold=True), self.glance_privacy]
+
+    def _update_glance_privacy(self):
+        self.glance_privacy.setText(together_privacy(self.glance_toggle.isEnabled() and self.glance_toggle.isChecked()))
+
+    def set_frame_glance_available(self, available):
+        self.glance_toggle.setEnabled(available)
+        self.glance_note.setText("画面发送需要 HTTPS 或本机连接。当前服务器使用非本机的 HTTP，画面发送已关闭。")
+        self.glance_note.setVisible(not available)
+        self._update_glance_privacy()
 
     def set_together_note(self, text):
         self.together_note.setText(text or "")

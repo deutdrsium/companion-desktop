@@ -436,3 +436,16 @@ def test_frame_glance_setting_updates_privacy(ctl):
         assert ctl.prefs.get("together_frame_glance") is enabled
         assert together_privacy(enabled) in [label.text() for label in labels]
         assert ctl.together.picker.privacy.text() == together_privacy(enabled)
+
+
+def test_frame_glance_settings_disable_remote_cleartext(ctl):
+    ctl.prefs.set("together_frame_glance", True)
+    ctl.backend.base = "http://192.0.2.1"
+    ctl.open_settings(PAGES.index("一起听看"))
+    assert not ctl.settings.glance_toggle.isEnabled()
+    assert ctl.settings.glance_note.isVisible() and "HTTPS" in ctl.settings.glance_note.text()
+    assert ctl.settings.glance_privacy.text() == together_privacy(False)
+    ctl._link_up("https://example.test")
+    assert ctl.settings.glance_toggle.isEnabled() and ctl.settings.glance_toggle.isChecked()
+    assert not ctl.settings.glance_note.isVisible()
+    ctl.settings.close()

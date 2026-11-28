@@ -1,14 +1,16 @@
 """Consented media sessions and local reaction scheduling."""
 
 import asyncio
-from time import monotonic
+from math import isfinite
+from threading import Event
+from time import monotonic, time
 from uuid import uuid4
 
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 
 from ..contracts.lines import parse_reply
 from ..contracts.wire import ProtocolError, utterance
-from .frame_glance import jpeg_base64, scene_cut, signature, thumbnail
+from .frame_glance import changed_scene
 from .media_sources import LocalPlayer, SystemMedia, TimedText, wire_text
 
 
@@ -66,7 +68,11 @@ class SharedMedia(QObject):
         self._credits = self._owner_speaking = False
         self._frame_glance = False
         self._glance_frame = self._glance_pending = self._glance_task = None
+        self._glance_signature_task = None
         self._last_glance = self._glance_budget_at = float("-inf")
+        self._glance_store = None
+        self._glance_token = None
+        self.glance_transport_allowed = lambda: True
         self.can_present = lambda: False
         self._state = {"type": "shared_media.state", "status": "idle", "media_id": None, "seq": -1}
 
@@ -186,7 +192,8 @@ class SharedMedia(QObject):
         self._schedule_sync()
 
     async def close(self):
-        tasks = tuple(task for task in (self._poll_task, self._sync_task, self._comment_task, self._glance_task)
+        tasks = tuple(task for task in (self._poll_task, self._sync_task, self._comment_task, self._glance_task,
+                                        self._glance_signature_task)
                       if task is not None)
         self._adopt_session(None)
         for task in tasks:
@@ -230,13 +237,23 @@ class SharedMedia(QObject):
             self._offer("L2", "owner_speech")
             self._offer_glance("owner_speech")
 
-    def set_frame_glance(self, enabled):
+    def set_frame_glance(self, enabled, *, store=None):
+        if store is not None:
+            self._glance_store = store
+            last = store.value("frame_glance_last", 0.0, type=float)
+            budget_at = store.value("frame_glance_budget_at", 0.0, type=float)
+            if last > 0 and isfinite(last) and isfinite(budget_at):
+                wall_now, now = time(), self.clock()
+                elapsed = max(0, wall_now - last)
+                self._last_glance = now - elapsed
+                self._glance_budget_at = now - elapsed + min(2 * GLANCE_AVERAGE_SECONDS, budget_at - last)
         self._frame_glance = enabled is True
         self._update_frame_sampling()
 
     def _glance_active(self):
         return (self._frame_glance and self._armed and self._source == "local_player" and self._kind == "movie"
-                and not self._loading_local and self._ref is not None and self._ref == self._granted_session())
+                and not self._loading_local and self._ref is not None and self._ref == self._granted_session()
+                and self.glance_transport_allowed())
 
     def _update_frame_sampling(self):
         enabled = self._glance_active()
@@ -246,13 +263,16 @@ class SharedMedia(QObject):
             self._cancel_glance()
 
     def _cancel_glance(self):
+        if self._glance_token is not None:
+            self._glance_token.clear()
+            self._glance_token = None
         self._glance_pending = None
         if self._glance_task is not None:
             self._glance_task.cancel()
             self._glance_task = None
 
-    def _sample_glance(self, image):
-        if image is None:
+    def _sample_glance(self, sample):
+        if sample is None:
             self._glance_frame = None
             self._cancel_glance()
             return
@@ -262,26 +282,43 @@ class SharedMedia(QObject):
         item = self._item
         if item is None or item.ended or self._seek_until:
             return
-        image = thumbnail(image)
-        if image.isNull():
-            return
-        now, cue = self.clock(), self.current_line
-        visual = signature(image)
+        now = self.clock()
         previous = self._glance_frame
-        self._glance_frame = image, visual, cue, item.loudness, now, item.position_ms
-        if previous is None or item.status != "playing" or now - previous[4] > 1:
+        current = self._glance_frame = (sample, self.current_line, item.loudness, now, item.position_ms)
+        if (previous is None or item.status != "playing" or now - previous[3] > 1
+                or self._glance_signature_task is not None or self._glance_pending is not None
+                or self._glance_task is not None or not self._glance_budget(now)):
             return
-        _, last_visual, last_cue, last_level, _, _ = previous
-        if scene_cut(last_visual, visual):
-            if (item.loudness is not None and last_level is not None and item.loudness >= 0.25
-                    and item.loudness - last_level >= 0.12):
-                self._offer_glance("loudness_peak")
-            elif cue != last_cue:
-                self._offer_glance("scene_cut")
+        _, cue, level, _, _ = current
+        _, last_cue, last_level, _, _ = previous
+        if level is not None and last_level is not None and level >= 0.25 and level - last_level >= 0.12:
+            reason = "loudness_peak"
+        elif cue != last_cue:
+            reason = "scene_cut"
+        else:
+            return
+        self._glance_signature_task = self.loop.create_task(self._check_glance_cut(previous, current, reason))
+
+    async def _check_glance_cut(self, previous, current, reason):
+        try:
+            cut = await asyncio.to_thread(changed_scene, previous[0], current[0])
+            if cut and self._glance_frame is current:
+                self._offer_glance(reason)
+        finally:
+            self._glance_signature_task = None
 
     def _glance_budget(self, now):
         return (now - self._last_glance >= GLANCE_MIN_SECONDS
                 and now >= self._glance_budget_at - GLANCE_AVERAGE_SECONDS)
+
+    def _reserve_glance(self, now):
+        self._last_glance = now
+        self._glance_budget_at = max(now, self._glance_budget_at) + GLANCE_AVERAGE_SECONDS
+        if self._glance_store is not None:
+            wall_now = time()
+            self._glance_store.setValue("frame_glance_last", wall_now)
+            self._glance_store.setValue("frame_glance_budget_at", wall_now + (self._glance_budget_at - now))
+            self._glance_store.sync()
 
     def _offer_glance(self, reason):
         item, now = self._item, self.clock()
@@ -289,12 +326,12 @@ class SharedMedia(QObject):
                 or item is None or item.ended or self._glance_pending is not None or self._glance_task is not None
                 or not self._glance_budget(now)):
             return
-        image, _, _, _, sampled_at, position = self._glance_frame
+        frame, _, _, sampled_at, position = self._glance_frame
         if (reason != "owner_speech" or item.status == "playing") and now - sampled_at > 1:
             return
         if position is not None and item.position_ms is not None and abs(item.position_ms - position) > 1250:
             return
-        self._glance_pending = reason, image, now
+        self._glance_pending = reason, frame, now
         self._schedule_sync()
 
     def mark_credits(self):
@@ -474,8 +511,6 @@ class SharedMedia(QObject):
             cue = wire_text(payload.get("cue"), 300)
             if cue:
                 wire["cue"] = cue
-        elif operation == "glance":
-            wire.update(reason=payload["reason"], image=payload["image"])
         return await self._request(operation, ref, wire)
 
     def _set_pose(self, cue, strength):
@@ -637,25 +672,35 @@ class SharedMedia(QObject):
                     self._last_movie_l1 = self._last_comment
                 self._comment_task = self.loop.create_task(self._comment(ref, remote, self._seq, *pending))
 
-    async def _send_glance(self, media_id, seq, epoch, reason, image, at):
+    async def _send_glance(self, media_id, seq, epoch, reason, frame, at):
         task = asyncio.current_task()
+        ref = self._ref
+        token = self._glance_token = Event()
+        token.set()
+
+        def current():
+            return (token.is_set() and self._glance_active() and not self._seek_until
+                    and self._epoch == epoch and self._seq == seq
+                    and self._ref == ref and self._desired_id == self._remote_id == media_id
+                    and self.clock() - at < GLANCE_MAX_AGE)
+
         try:
             self._read_local()
+            if not current():
+                return
+            encoded = await asyncio.to_thread(frame.jpeg)
             now = self.clock()
-            if (not self._glance_active() or self._seek_until or self._epoch != epoch or self._seq != seq
-                    or self._desired_id != media_id or now - at >= GLANCE_MAX_AGE or not self._glance_budget(now)):
+            if encoded is None or not current() or not self._glance_budget(now):
                 return
-            encoded = jpeg_base64(image)
-            if encoded is None:
-                return
-            self._last_glance = now
-            self._glance_budget_at = max(now, self._glance_budget_at) + GLANCE_AVERAGE_SECONDS
-            await self._send("glance", self._ref, {"media_id": media_id, "seq": seq, "reason": reason, "image": encoded})
+            self._reserve_glance(now)
+            await self._request("glance", ref, {"media_id": media_id, "seq": seq, "reason": reason, "image": encoded},
+                                before_send=current)
         except (ProtocolError, ConnectionError, TimeoutError):
             pass
         finally:
             if self._glance_task is task:
                 self._glance_task = None
+                self._glance_token = None
 
     @staticmethod
     def _response_state(data):

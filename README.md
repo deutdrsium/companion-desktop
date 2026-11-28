@@ -70,6 +70,7 @@ after a major cut with a subtitle change or loudness peak, on pause, or after
 the owner's speech. Frames stay in memory on the desktop and are sampled only
 while enabled. Uploads average at most one per ten minutes, at least three
 minutes apart, and use the authenticated `/desktop/shared-media/glance` route.
+That limit survives restarts. Frame uploads require HTTPS or a loopback connection.
 
 Shared snapshots contain a sanitized title, media kind, source, playback status and
 timing. Local audio contributes numeric RMS levels. Only Windows music sessions can

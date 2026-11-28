@@ -508,6 +508,7 @@ class Together(QObject):
         self.video_window = video_window
         self.video = None
         self.kind = self.source = None
+        self.glance_available = True
         self.reactions = {}           # reaction_id -> bubble
         self.cancelled = []           # recently cancelled reaction ids, newest last
         self.active = False
@@ -552,6 +553,10 @@ class Together(QObject):
 
     def _reason(self):
         self.picker.set_reason(self.reason())
+
+    def set_frame_glance_available(self, available):
+        self.glance_available = available
+        self.picker.privacy.setText(together_privacy(available and self.prefs.get("together_frame_glance")))
 
     # ------------------------------------------------------------ entry
     def open(self):
@@ -734,4 +739,4 @@ class Together(QObject):
         elif key == "together_source" and not self.picker.isVisible():
             self.picker.set_source(value)
         elif key == "together_frame_glance":
-            self.picker.privacy.setText(together_privacy(value))
+            self.picker.privacy.setText(together_privacy(self.glance_available and value))

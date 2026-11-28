@@ -5,10 +5,12 @@ draft, and the link is rebuilt after 1, 2, 4 ... 30 s.
 """
 
 import logging
+from ipaddress import ip_address
 import socket
 import subprocess
 import threading
 import time
+from urllib.parse import urlsplit
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
@@ -19,6 +21,19 @@ BACKOFF_S = (1, 2, 4, 8, 16, 30)
 
 class TunnelError(RuntimeError):
     pass
+
+
+def frame_glance_allowed(url):
+    try:
+        endpoint = urlsplit(url)
+        host = endpoint.hostname
+        if not host or endpoint.username is not None:
+            return False
+        if endpoint.scheme == "https":
+            return True
+        return endpoint.scheme == "http" and (host == "localhost" or ip_address(host).is_loopback)
+    except ValueError:
+        return False
 
 
 def free_port():

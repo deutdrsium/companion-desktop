@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from PyQt5.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
 
-from .frame_glance import FrameTap
+from .frame_glance import FrameSample, FrameTap
 
 
 _LOCATION = re.compile(
@@ -137,10 +137,12 @@ class LocalPlayer(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt5.QtMultimedia import QAudioProbe, QMediaContent, QMediaPlayer
+        from PyQt5.QtMultimedia import QAbstractVideoBuffer, QAudioProbe, QMediaContent, QMediaPlayer, QVideoFrame
 
         self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
         self._content = QMediaContent
+        self._video_frame = QVideoFrame
+        self._cpu_video = QAbstractVideoBuffer.NoHandle
         self._probe = QAudioProbe(self)
         self._key = self._title = self._level = None
         self._level_at = 0.0
@@ -209,16 +211,14 @@ class LocalPlayer(QObject):
 
     def _sample_frame(self, tap, frame):
         now = monotonic()
-        if (not self._sample_enabled or tap is not self._frame_tap
+        if (not self._sample_enabled or tap is not self._frame_tap or not frame.isValid()
+                or frame.handleType() != self._cpu_video
                 or self.player.state() == self.player.StoppedState or now - self._sample_at < 1 / 3):
             return
         self._sample_at = now
-        image = frame.image()
-        if not image.isNull():
-            surface_format = tap.surfaceFormat()
-            if surface_format.scanLineDirection() == surface_format.BottomToTop:
-                image = image.mirrored(False, True)
-            self.frame_sampled.emit(image)
+        surface_format = tap.surfaceFormat()
+        mirrored = surface_format.scanLineDirection() == surface_format.BottomToTop
+        self.frame_sampled.emit(FrameSample(self._video_frame(frame), mirrored))
 
     def _audio(self, buffer):
         if self.player.state() != self.player.PlayingState or not buffer.isValid():
